@@ -47,6 +47,18 @@ def run_digest(args):
     return call_service("GET", "/digest" + query)
 
 
+def run_text(args):
+    query = f'?chars={int(args.get("chars", 6000))}'
+    if args.get("tab"):
+        query += f'&tab={args["tab"]}'
+    return call_service("GET", "/text" + query)
+
+
+def text_text(payload):
+    head = f'{payload["title"]} | {payload["url"]} | {payload["total"]} lines' + (" (cut short)" if payload["truncated"] else "")
+    return "\n".join([head] + payload["lines"])
+
+
 def run_open(args):
     return call_service("POST", "/open", {"url": args["url"], "tab": args.get("tab")})
 
@@ -87,6 +99,15 @@ TOOLS = [
             "tab": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}},
         "run": run_digest,
         "text": digest_text,
+    },
+    {
+        "name": "text",
+        "description": "Read the visible text of the page: prices, titles, descriptions. Use this when the digest "
+                       "shows links but not the information you need.",
+        "inputSchema": {"type": "object", "properties": {
+            "tab": {"type": "string"}, "chars": {"type": "integer", "minimum": 500, "maximum": 20000}}},
+        "run": run_text,
+        "text": text_text,
     },
     {
         "name": "open",

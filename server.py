@@ -15,6 +15,7 @@ Brave starts when a tool needs it, and it stops when the user asks (POST /browse
   POST /act {tab, action, ref?, value?, key?, approvalId?}
                                     -> {delta, url, title, loginWall}
                                        or 409 approval_required / stale_ref, 403 origin_not_granted
+  GET  /text?tab=ID&chars=N         -> visible text of the page as lines (prices, descriptions)
   GET  /events, /requests, /approvals, /permissions
   POST /permissions {origin, hours?}      hours null/absent = until revoked
   POST /permissions/revoke {origin}
@@ -169,6 +170,25 @@ BAR_JS = """(() => {
   document.documentElement.appendChild(bar);
   window.__jarriBar = { set: t => { text.textContent = t; } };
 })();"""
+
+# The visible text of the page, line by line, without the control bar. Prices and descriptions live here.
+TEXT_JS = """(() => {
+  const MAX = __MAX__;
+  const bar = document.querySelector('[data-jarri-ui]');
+  const shown = bar ? bar.style.display : null;
+  if (bar) bar.style.display = 'none';
+  const raw = document.body ? document.body.innerText : '';
+  if (bar) bar.style.display = shown;
+  const lines = raw.split('\\n').map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean);
+  const out = [];
+  let size = 0;
+  for (const line of lines) {
+    if (size + line.length > MAX) break;
+    out.push(line);
+    size += line.length + 1;
+  }
+  return { url: location.href, title: document.title, lines: out, total: lines.length, truncated: out.length < lines.length };
+})()"""
 
 FOCUS_JS = """(() => {
   const el = document.querySelector('[data-jarri-ref="__REF__"]');
@@ -520,6 +540,14 @@ def read_page(tab_id, page, limit):
     }
 
 
+def read_text(tab, chars):
+    tab_id, page = tab_connection(tab)
+    ensure_granted(current_url(page))
+    result = page.evaluate(TEXT_JS.replace("__MAX__", str(chars)))
+    return {"url": result["url"], "title": result["title"], "lines": result["lines"],
+            "total": result["total"], "truncated": result["truncated"]}
+
+
 def find_ref(tab_id, ref):
     items = REFS.get(tab_id)
     if items is None:
@@ -717,6 +745,9 @@ def route(method, path, qs, body):
         if path == "/digest":
             limit = min(max(int(qs.get("limit", [DEFAULT_LIMIT])[0]), 1), MAX_LIMIT)
             return 200, digest(qs.get("tab", [None])[0], limit)
+        if path == "/text":
+            chars = min(max(int(qs.get("chars", [6000])[0]), 500), 20000)
+            return 200, read_text(qs.get("tab", [None])[0], chars)
         if path == "/events":
             return 200, list(EVENTS)
         if path == "/requests":
