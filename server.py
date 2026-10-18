@@ -49,8 +49,14 @@ INTENT_S = 0.3
 SETTLE_S = 0.4
 DEFAULT_LIMIT = 60
 MAX_LIMIT = 200
+# Clicks or Enter presses whose label or form text matches this need the user's approval.
 RISKY = re.compile(
-    r"köp|betala|skicka|send|submit|radera|ta bort|delete|publicera|publish|bekräfta|confirm|pay|checkout|logga ut|sign out",
+    r"köp|betala|betalning|pay|checkout|faktura|invoice|"
+    r"prenumer|subscribe|upgrade|uppgradera|"
+    r"logga in|logga ut|log ?in|log ?out|sign ?in|sign ?out|lösenord|password|2fa|verifiera|verify|"
+    r"säkerhet|security|api[- ]?nyckel|api[- ]?key|token|secret|behörighet|permission|"
+    r"skicka|send|submit|radera|ta bort|delete|remove|avaktivera|disable|återkalla|revoke|"
+    r"publicera|publish|deploy|dela|share|bekräfta|confirm",
     re.IGNORECASE,
 )
 PRESS_KEYS = {"Enter": (13, "\r"), "Tab": (9, ""), "Escape": (27, "")}
@@ -128,6 +134,14 @@ RESOLVE_JS = """(() => {
   document.body.append(frame, tag);
   setTimeout(() => { frame.remove(); tag.remove(); }, 1500);
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()"""
+
+FOCUSED_JS = """(() => {
+  const el = document.activeElement;
+  if (!el || el === document.body) return '';
+  const own = el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || '';
+  const form = el.form ? el.form.innerText : '';
+  return (own + ' ' + form).replace(/\\s+/g, ' ').trim().slice(0, 300);
 })()"""
 
 FOCUS_JS = """(() => {
@@ -466,6 +480,21 @@ def open_url(body):
     return read_page(tab_id, cdp, DEFAULT_LIMIT)
 
 
+def require_approval(tab_id, ref, label, action, approval_id):
+    approval = APPROVALS.get(approval_id)
+    if approval and approval["approved"] and approval["tab"] == tab_id \
+            and approval["ref"] == ref and approval["action"] == action:
+        del APPROVALS[approval_id]  # one approval, one action
+        return
+    approval_id = uuid.uuid4().hex[:8]
+    APPROVALS[approval_id] = {
+        "id": approval_id, "tab": tab_id, "ref": ref, "label": label,
+        "action": action, "approved": False, "at": int(time.time()),
+    }
+    log("approval", f'Väntar på godkännande: {action} "{label}"')
+    raise ApiError(409, {"error": "approval_required", "approvalId": approval_id, "label": label})
+
+
 def act(body):
     check_paused()
     tab_id, cdp = tab_connection(body.get("tab") or None)
@@ -478,6 +507,10 @@ def act(body):
         if key not in PRESS_KEYS:
             raise ApiError(400, {"error": "bad_key", "allowed": list(PRESS_KEYS)})
         label = f"tangent {key}"
+        if key == "Enter":
+            context = cdp.evaluate(FOCUSED_JS) or ""
+            if RISKY.search(context):
+                require_approval(tab_id, "", context, "press", body.get("approvalId"))
     elif action in ("click", "type"):
         ref = str(body.get("ref", ""))
         if not ref.isdigit():
@@ -487,18 +520,7 @@ def act(body):
             raise ApiError(403, {"error": "not_typeable", "kind": item["kind"]})
         label = f'{item["kind"]} "{item["label"]}"'
         if action == "click" and RISKY.search(item["label"]):
-            approval_id = body.get("approvalId")
-            approval = APPROVALS.get(approval_id)
-            if approval and approval["approved"] and approval["tab"] == tab_id and approval["ref"] == ref:
-                del APPROVALS[approval_id]
-            else:
-                approval_id = uuid.uuid4().hex[:8]
-                APPROVALS[approval_id] = {
-                    "id": approval_id, "tab": tab_id, "ref": ref, "label": item["label"],
-                    "action": action, "approved": False, "at": int(time.time()),
-                }
-                log("approval", f'Väntar på godkännande: klicka "{item["label"]}"')
-                raise ApiError(409, {"error": "approval_required", "approvalId": approval_id, "label": item["label"]})
+            require_approval(tab_id, ref, item["label"], action, body.get("approvalId"))
     else:
         raise ApiError(400, {"error": "bad_action"})
 
@@ -568,10 +590,10 @@ def decide(body):
         raise ApiError(404, {"error": "no_such_approval"})
     if body.get("approve"):
         approval["approved"] = True
-        log("approval", f'Godkänd: klicka "{approval["label"]}"')
+        log("approval", f'Godkänd: {approval["action"]} "{approval["label"]}"')
     else:
         del APPROVALS[approval["id"]]
-        log("approval", f'Nekad: klicka "{approval["label"]}"')
+        log("approval", f'Nekad: {approval["action"]} "{approval["label"]}"')
     return {"ok": True}
 
 
