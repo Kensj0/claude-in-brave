@@ -114,7 +114,7 @@ DIGEST_JS = """(() => {
     if (kind === 'select') return clean(el.selectedOptions[0]?.textContent || '');
     return null;
   };
-  const all = [...document.querySelectorAll(SEL)].filter(shown);
+  const all = [...document.querySelectorAll(SEL)].filter(el => !el.closest('[data-jarri-ui]') && shown(el));
   const items = all.slice(0, LIMIT).map((el, i) => {
     el.setAttribute('data-jarri-ref', String(i + 1));
     const kind = kindOf(el);
@@ -146,6 +146,29 @@ FOCUSED_JS = """(() => {
   const form = el.form ? el.form.innerText : '';
   return (own + ' ' + form).replace(/\\s+/g, ' ').trim().slice(0, 300);
 })()"""
+
+# The control bar at the bottom of every page. Its buttons call window.jarriControl, which the
+# service receives over the pipe. The bar is marked data-jarri-ui, so Claude never sees its buttons.
+BAR_JS = """(() => {
+  if (window.__jarriBar) return;
+  const bar = document.createElement('div');
+  bar.setAttribute('data-jarri-ui', 'bar');
+  bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;display:flex;align-items:center;gap:8px;padding:6px 12px;background:#1e1b2e;color:#fff;font:13px system-ui,sans-serif;box-shadow:0 -2px 8px rgba(0,0,0,.3)';
+  const text = document.createElement('span');
+  text.style.cssText = 'flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis';
+  text.textContent = 'Claude väntar';
+  const button = (label, cmd) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.setAttribute('data-cmd', cmd);
+    b.style.cssText = 'padding:4px 10px;border:0;border-radius:4px;cursor:pointer;background:#7c3aed;color:#fff;font:13px system-ui,sans-serif';
+    b.onclick = () => window.jarriControl(cmd);
+    return b;
+  };
+  bar.append(text, button('▶ Kör', 'play'), button('❚❚ Paus', 'pause'), button('■ Stopp', 'stop'));
+  document.documentElement.appendChild(bar);
+  window.__jarriBar = { set: t => { text.textContent = t; } };
+})();"""
 
 FOCUS_JS = """(() => {
   const el = document.querySelector('[data-jarri-ref="__REF__"]');
@@ -198,10 +221,14 @@ class Pipe:
                 if not raw:
                     continue
                 message = json.loads(raw)
-                if "id" in message:  # events without an id are ignored
+                if "id" in message:
                     with self.cond:
                         self.pending[message["id"]] = message
                         self.cond.notify_all()
+                elif message.get("method") == "Runtime.bindingCalled":
+                    params = message.get("params", {})
+                    if params.get("name") == "jarriControl":  # a button on the control bar was pressed
+                        threading.Thread(target=bar_command, args=(params.get("payload", ""),), daemon=True).start()
 
     def call(self, method, params=None, session=None):
         with self.cond:
@@ -320,6 +347,8 @@ def ensure_browser():
     global BROWSER
     if BROWSER is not None and not BROWSER.closed:
         return BROWSER
+    if PAUSED:  # after Stop, nothing starts again until the user presses Play
+        raise ApiError(423, {"error": "paused"})
     if not os.path.exists(BRAVE_BIN):
         raise ApiError(503, {"error": "brave_not_found", "path": BRAVE_BIN})
     cmd_r, cmd_w = os.pipe()
@@ -367,6 +396,35 @@ def stop_browser():
 atexit.register(stop_browser)
 
 
+def bar_text():
+    if PAUSED:
+        return "Claude är pausad"
+    intents = [e for e in EVENTS if e["type"] == "intent"]
+    return intents[-1]["text"] if intents else "Claude väntar"
+
+
+def bar_update():
+    text = json.dumps(bar_text())
+    for page in list(CONNS.values()):
+        try:
+            page.evaluate(f"window.__jarriBar && window.__jarriBar.set({text})")
+        except (CdpError, ConnectionError, OSError):
+            pass
+
+
+def bar_command(cmd):
+    """Runs when a button on the control bar is pressed in Brave."""
+    global PAUSED
+    if cmd == "stop":
+        PAUSED = True
+        log("pause", "Stoppad från fältet i Brave")
+        stop_browser()
+        return
+    PAUSED = cmd != "play"
+    log("pause", "Pausad från fältet i Brave" if PAUSED else "Igång igen från fältet i Brave")
+    bar_update()
+
+
 def page_list():
     pipe = ensure_browser()
     infos = pipe.call("Target.getTargets")["targetInfos"]
@@ -379,7 +437,9 @@ def tab_connection(tab_id):
     if tab_id:
         target = next((t for t in pages if t["targetId"] == tab_id), None)
     else:
-        target = pages[0] if pages else None
+        if not pages:  # Brave started without a window: give it an empty tab
+            pages = [{"targetId": pipe.call("Target.createTarget", {"url": "about:blank"})["targetId"]}]
+        target = pages[0]
     if target is None:
         raise ApiError(404, {"error": "no_such_tab"})
     tid = target["targetId"]
@@ -387,6 +447,9 @@ def tab_connection(tab_id):
         session = pipe.call("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
         page = Page(pipe, session)
         page.call("Page.setDownloadBehavior", {"behavior": "deny"})  # no files leave or land on disk
+        page.call("Runtime.addBinding", {"name": "jarriControl"})
+        page.call("Page.addScriptToEvaluateOnNewDocument", {"source": BAR_JS})
+        page.evaluate(BAR_JS)
         CONNS[tid] = page
     return tid, CONNS[tid]
 
@@ -571,6 +634,7 @@ def act(body):
         raise ApiError(400, {"error": "bad_action"})
 
     log("intent", f"Nästa: {action} {label}")
+    bar_update()
     time.sleep(INTENT_S)
     check_paused()
 
@@ -684,6 +748,7 @@ def route(method, path, qs, body):
         if path == "/pause":
             PAUSED = bool(body.get("on"))
             log("pause", "Pausad" if PAUSED else "Igång igen")
+            bar_update()
             return 200, {"paused": PAUSED}
         if path == "/focus":
             tab_id, _ = tab_connection(body.get("tab"))
