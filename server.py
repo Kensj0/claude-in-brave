@@ -1,10 +1,13 @@
 """Jarri browser service: Claude's access to Brave, with access control and a visible action log.
 
 Backend only. Jarri's browser panel is a client of this service.
-Brave runs with --remote-debugging-port (start-brave.sh) on 127.0.0.1 and its own profile.
-The service talks CDP to it over a small built-in WebSocket client (stdlib only).
+The service starts Brave itself, with --remote-debugging-pipe. The debug channel is a pipe between
+this process and Brave, not a network port, so no other program can connect to Brave through it.
+Brave starts when a tool needs it, and it stops when the user asks (POST /browser/stop).
 
-  GET  /status                      -> {debugPort, available, paused, tabs}
+  GET  /status                      -> {running, paused, tabs}
+  POST /browser/start               -> opens Brave's window if it is not open
+  POST /browser/stop                -> closes Brave
   GET  /tabs                        -> [{id, title, url, origin, granted}]
   GET  /digest?tab=ID&limit=N       -> {status, url, title, loginWall, total, items}
                                        refs are valid until the next read of that tab
@@ -24,26 +27,24 @@ Passwords are never returned, and Claude can not type into them. Cookies and sto
 Binds to 127.0.0.1 only and accepts requests from the same allowed origins as the other services.
 """
 
-import base64
+import atexit
 import json
 import os
 import re
-import socket
-import struct
+import subprocess
 import threading
 import time
 import uuid
 from collections import deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.error import URLError
 from urllib.parse import urlparse, parse_qs
-from urllib.request import Request, urlopen
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("JARRI_BROWSER_PORT", "8786"))
-DEBUG_PORT = int(os.environ.get("JARRI_BROWSER_DEBUG_PORT", "9222"))
 STATE_DIR = os.path.expanduser(os.environ.get("JARRI_BROWSER_STATE", "~/.local/state/jarri-browser"))
 PERMISSIONS_FILE = os.path.join(STATE_DIR, "permissions.json")
+BRAVE_BIN = os.environ.get("JARRI_BRAVE_BIN", "/opt/brave.com/brave/brave")
+BRAVE_PROFILE = os.path.expanduser(os.environ.get("JARRI_BROWSER_PROFILE", "~/.brave-claude"))
 TIMEOUT_S = 10
 INTENT_S = 0.3
 SETTLE_S = 0.4
@@ -166,84 +167,74 @@ class ApiError(Exception):
         self.body = body
 
 
-class Cdp:
-    """Minimal CDP client over a WebSocket on localhost."""
+class Pipe:
+    """CDP over Brave's --remote-debugging-pipe: messages are JSON terminated by a NUL byte."""
 
-    def __init__(self, ws_url):
-        match = re.match(r"ws://([^:/]+):(\d+)(/.*)", ws_url)
-        host, port, path = match.group(1), int(match.group(2)), match.group(3)
-        self.sock = socket.create_connection((host, port), timeout=TIMEOUT_S)
-        key = base64.b64encode(os.urandom(16)).decode()
-        self.sock.sendall((
-            f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
-            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        ).encode())
-        head = self._read_until(b"\r\n\r\n")
-        if b" 101 " not in head.split(b"\r\n")[0]:
-            raise ConnectionError("websocket handshake failed")
+    def __init__(self, proc, cmd_w, resp_r):
+        self.proc = proc
+        self.cmd_w = cmd_w
+        self.resp_r = resp_r
         self.next_id = 0
+        self.pending = {}
+        self.closed = False
+        self.cond = threading.Condition()
+        threading.Thread(target=self._reader, daemon=True).start()
 
-    def _read_until(self, marker):
+    def _reader(self):
         buf = b""
-        while not buf.endswith(marker):
-            chunk = self.sock.recv(1)
-            if not chunk:
-                raise ConnectionError("closed")
-            buf += chunk
-        return buf
-
-    def _recv(self, n):
-        buf = b""
-        while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("closed")
-            buf += chunk
-        return buf
-
-    def _message(self):
-        parts = []
         while True:
-            b1, b2 = self._recv(2)
-            fin, op, length = b1 & 0x80, b1 & 0x0F, b2 & 0x7F
-            if length == 126:
-                length = struct.unpack(">H", self._recv(2))[0]
-            elif length == 127:
-                length = struct.unpack(">Q", self._recv(8))[0]
-            payload = self._recv(length) if length else b""
-            if op == 0x8:
-                raise ConnectionError("closed by peer")
-            if op == 0x9:
-                self._frame(payload, 0xA)
-                continue
-            if op == 0xA:
-                continue
-            parts.append(payload)
-            if fin:
-                return b"".join(parts)
+            try:
+                chunk = os.read(self.resp_r, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                with self.cond:
+                    self.closed = True
+                    self.cond.notify_all()
+                return
+            buf += chunk
+            while b"\0" in buf:
+                raw, buf = buf.split(b"\0", 1)
+                if not raw:
+                    continue
+                message = json.loads(raw)
+                if "id" in message:  # events without an id are ignored
+                    with self.cond:
+                        self.pending[message["id"]] = message
+                        self.cond.notify_all()
 
-    def _frame(self, payload, op):
-        mask = os.urandom(4)
-        n = len(payload)
-        if n < 126:
-            header = bytes([0x80 | op, 0x80 | n])
-        elif n < 65536:
-            header = bytes([0x80 | op, 0x80 | 126]) + struct.pack(">H", n)
-        else:
-            header = bytes([0x80 | op, 0x80 | 127]) + struct.pack(">Q", n)
-        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    def call(self, method, params=None, session=None):
+        with self.cond:
+            if self.closed:
+                raise ConnectionError("browser is closed")
+            self.next_id += 1
+            mid = self.next_id
+        message = {"id": mid, "method": method, "params": params or {}}
+        if session:
+            message["sessionId"] = session
+        os.write(self.cmd_w, json.dumps(message).encode() + b"\0")
+        with self.cond:
+            end = time.time() + TIMEOUT_S
+            while mid not in self.pending:
+                left = end - time.time()
+                if left <= 0 or self.closed:
+                    raise ConnectionError("no answer from browser")
+                self.cond.wait(left)
+            reply = self.pending.pop(mid)
+        if "error" in reply:
+            raise CdpError(reply["error"].get("message", "cdp error"))
+        return reply.get("result", {})
+
+
+class Page:
+    """One tab, reached through a session on the pipe."""
+
+    def __init__(self, pipe, session):
+        self.pipe = pipe
+        self.session = session
 
     def call(self, method, params=None):
-        self.next_id += 1
-        mid = self.next_id
-        self._frame(json.dumps({"id": mid, "method": method, "params": params or {}}).encode(), 0x1)
-        while True:
-            msg = json.loads(self._message())
-            if msg.get("id") != mid:
-                continue
-            if "error" in msg:
-                raise CdpError(msg["error"].get("message", "cdp error"))
-            return msg.get("result", {})
+        return self.pipe.call(method, params, session=self.session)
 
     def evaluate(self, expression):
         result = self.call("Runtime.evaluate", {
@@ -260,8 +251,9 @@ EVENTS = deque(maxlen=300)
 REQUESTS = []   # access/login requests waiting for the user
 APPROVALS = {}  # id -> risky action waiting for the user
 REFS = {}       # tab id -> items from the last read (refs only mean something for that read)
-CONNS = {}      # tab id -> Cdp
+CONNS = {}      # tab id -> Page
 PERMS = {}      # origin -> {"until": epoch seconds | None}
+BROWSER = None  # Pipe to the running Brave, or None
 
 
 def log(kind, text):
@@ -323,57 +315,104 @@ def check_paused():
         raise ApiError(423, {"error": "paused"})
 
 
-def page_targets():
+def ensure_browser():
+    """Start Brave with the debug pipe if it is not running. Its fds 3 and 4 are the pipe."""
+    global BROWSER
+    if BROWSER is not None and not BROWSER.closed:
+        return BROWSER
+    if not os.path.exists(BRAVE_BIN):
+        raise ApiError(503, {"error": "brave_not_found", "path": BRAVE_BIN})
+    cmd_r, cmd_w = os.pipe()
+    resp_r, resp_w = os.pipe()
+
+    def child_setup():
+        os.dup2(cmd_r, 3)
+        os.dup2(resp_w, 4)
+        os.set_inheritable(3, True)
+        os.set_inheritable(4, True)
+        os.closerange(5, 65536)  # the child keeps only stdin, stdout, stderr and the pipe
+
+    os.makedirs(BRAVE_PROFILE, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "brave.log"), "ab") as errors:
+        proc = subprocess.Popen(
+            [BRAVE_BIN, "--remote-debugging-pipe", f"--user-data-dir={BRAVE_PROFILE}",
+             "--no-first-run", "--no-default-browser-check", "about:blank"],
+            close_fds=False, preexec_fn=child_setup,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
+        )
+    os.close(cmd_r)
+    os.close(resp_w)
+    CONNS.clear()
+    BROWSER = Pipe(proc, cmd_w, resp_r)
+    log("browser", "Brave startad")
+    return BROWSER
+
+
+def stop_browser():
+    global BROWSER
+    if BROWSER is None:
+        return
     try:
-        with urlopen(f"http://{HOST}:{DEBUG_PORT}/json/list", timeout=TIMEOUT_S) as reply:
-            targets = json.load(reply)
-    except (URLError, OSError, ValueError):
-        return None
-    return [t for t in targets if t.get("type") == "page" and "webSocketDebuggerUrl" in t]
+        BROWSER.call("Browser.close")
+        BROWSER.proc.wait(timeout=10)
+    except Exception:
+        BROWSER.proc.kill()
+    BROWSER = None
+    CONNS.clear()
+    REFS.clear()
+    log("browser", "Brave stoppad")
 
 
-def new_tab():
-    request = Request(f"http://{HOST}:{DEBUG_PORT}/json/new?about:blank", method="PUT")
-    with urlopen(request, timeout=TIMEOUT_S) as reply:
-        return json.load(reply)["id"]
+atexit.register(stop_browser)
+
+
+def page_list():
+    pipe = ensure_browser()
+    infos = pipe.call("Target.getTargets")["targetInfos"]
+    return [t for t in infos if t["type"] == "page"]
 
 
 def tab_connection(tab_id):
-    targets = page_targets()
-    if targets is None:
-        raise ApiError(503, {"error": "brave_not_reachable", "hint": "run browser-service/start-brave.sh"})
-    target = next((t for t in targets if t["id"] == tab_id), None) if tab_id else (targets[0] if targets else None)
+    pipe = ensure_browser()
+    pages = page_list()
+    if tab_id:
+        target = next((t for t in pages if t["targetId"] == tab_id), None)
+    else:
+        target = pages[0] if pages else None
     if target is None:
         raise ApiError(404, {"error": "no_such_tab"})
-    if target["id"] not in CONNS:
-        conn = Cdp(target["webSocketDebuggerUrl"])
-        conn.call("Page.setDownloadBehavior", {"behavior": "deny"})  # no files leave or land on disk
-        CONNS[target["id"]] = conn
-    return target["id"], CONNS[target["id"]]
+    tid = target["targetId"]
+    if tid not in CONNS:
+        session = pipe.call("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
+        page = Page(pipe, session)
+        page.call("Page.setDownloadBehavior", {"behavior": "deny"})  # no files leave or land on disk
+        CONNS[tid] = page
+    return tid, CONNS[tid]
 
 
-def current_url(cdp):
-    return cdp.evaluate("location.href") or ""
+def current_url(page):
+    return page.evaluate("location.href") or ""
 
 
-def wait_ready(cdp, timeout=10):
+def wait_ready(page, timeout=10):
     time.sleep(0.3)
     end = time.time() + timeout
     while time.time() < end:
         try:
-            if cdp.evaluate("document.readyState") == "complete":
+            if page.evaluate("document.readyState") == "complete":
                 return
         except CdpError:
             pass
         time.sleep(0.2)
 
 
-def enforce_after_move(tab_id, cdp):
-    url = current_url(cdp)
+def enforce_after_move(tab_id, page):
+    url = current_url(page)
     origin = origin_of(url)
     if granted(origin):
         return
-    cdp.evaluate("history.back()")  # undo the move to a page Claude may not use
+    page.evaluate("history.back()")  # undo the move to a page Claude may not use
     REFS.pop(tab_id, None)
     rid = add_request(origin, url, "access")
     log("blocked", f"Blockerade {origin}")
@@ -401,20 +440,20 @@ def delta(before, after):
     return added + removed or ["(oförändrat)"]
 
 
-def read_page(tab_id, cdp, limit):
-    page = cdp.evaluate(DIGEST_JS.replace("__LIMIT__", str(limit)))
-    REFS[tab_id] = page["items"]
-    origin = origin_of(page["url"])
-    if page["loginWall"] and origin:
-        add_request(origin, page["url"], "login")
+def read_page(tab_id, page, limit):
+    result = page.evaluate(DIGEST_JS.replace("__LIMIT__", str(limit)))
+    REFS[tab_id] = result["items"]
+    origin = origin_of(result["url"])
+    if result["loginWall"] and origin:
+        add_request(origin, result["url"], "login")
         log("login", f"Inloggning krävs på {origin}")
     return {
-        "status": "awaiting_login" if page["loginWall"] else "ok",
-        "url": page["url"],
-        "title": page["title"],
-        "loginWall": page["loginWall"],
-        "total": page["total"],
-        "items": [line(i) for i in page["items"]],
+        "status": "awaiting_login" if result["loginWall"] else "ok",
+        "url": result["url"],
+        "title": result["title"],
+        "loginWall": result["loginWall"],
+        "total": result["total"],
+        "items": [line(i) for i in result["items"]],
     }
 
 
@@ -428,40 +467,41 @@ def find_ref(tab_id, ref):
     return item
 
 
-def locate(cdp, ref):
-    pos = cdp.evaluate(RESOLVE_JS.replace("__REF__", ref))
+def locate(page, ref):
+    pos = page.evaluate(RESOLVE_JS.replace("__REF__", ref))
     if not pos or pos.get("stale"):
         raise ApiError(409, {"error": "stale_ref", "hint": "read the page again"})
     return pos
 
 
 def status():
-    targets = page_targets()
+    running = BROWSER is not None and not BROWSER.closed
     return {
-        "debugPort": DEBUG_PORT,
-        "available": targets is not None,
+        "running": running,
         "paused": PAUSED,
-        "tabs": 0 if targets is None else len(targets),
+        "tabs": len(page_list()) if running else 0,
     }
 
 
 def tabs():
+    if BROWSER is None or BROWSER.closed:
+        return []
     return [
         {
-            "id": t["id"],
+            "id": t["targetId"],
             "title": t.get("title", ""),
             "url": t.get("url", ""),
             "origin": origin_of(t.get("url", "")),
             "granted": granted(origin_of(t.get("url", ""))),
         }
-        for t in (page_targets() or [])
+        for t in page_list()
     ]
 
 
 def digest(tab, limit):
-    tab_id, cdp = tab_connection(tab)
-    ensure_granted(current_url(cdp))
-    return read_page(tab_id, cdp, limit)
+    tab_id, page = tab_connection(tab)
+    ensure_granted(current_url(page))
+    return read_page(tab_id, page, limit)
 
 
 def open_url(body):
@@ -471,17 +511,17 @@ def open_url(body):
         raise ApiError(400, {"error": "only http and https"})
     ensure_granted(url)
     tab = body.get("tab") or None
-    targets = page_targets()
-    if targets is not None and not targets and tab is None:
-        tab = new_tab()
-    tab_id, cdp = tab_connection(tab)
-    result = cdp.call("Page.navigate", {"url": url})
+    pipe = ensure_browser()
+    if tab is None and not page_list():
+        tab = pipe.call("Target.createTarget", {"url": "about:blank"})["targetId"]
+    tab_id, page = tab_connection(tab)
+    result = page.call("Page.navigate", {"url": url})
     if result.get("errorText"):
         raise ApiError(502, {"error": "navigation_failed", "detail": result["errorText"]})
     log("open", f"Öppnar {url}")
-    wait_ready(cdp)
-    enforce_after_move(tab_id, cdp)
-    return read_page(tab_id, cdp, DEFAULT_LIMIT)
+    wait_ready(page)
+    enforce_after_move(tab_id, page)
+    return read_page(tab_id, page, DEFAULT_LIMIT)
 
 
 def require_approval(tab_id, ref, label, action, approval_id):
@@ -501,8 +541,8 @@ def require_approval(tab_id, ref, label, action, approval_id):
 
 def act(body):
     check_paused()
-    tab_id, cdp = tab_connection(body.get("tab") or None)
-    ensure_granted(current_url(cdp))
+    tab_id, page = tab_connection(body.get("tab") or None)
+    ensure_granted(current_url(page))
     action = body.get("action")
     before = REFS.get(tab_id, [])
 
@@ -512,7 +552,7 @@ def act(body):
             raise ApiError(400, {"error": "bad_key", "allowed": list(PRESS_KEYS)})
         label = f"tangent {key}"
         if key == "Enter":
-            context = cdp.evaluate(FOCUSED_JS) or ""
+            context = page.evaluate(FOCUSED_JS) or ""
             if RISKY.search(context):
                 require_approval(tab_id, "", context, "press", body.get("approvalId"))
     elif action in ("click", "type"):
@@ -535,31 +575,31 @@ def act(body):
     check_paused()
 
     if action == "click":
-        pos = locate(cdp, ref)
+        pos = locate(page, ref)
         for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
-            cdp.call("Input.dispatchMouseEvent", {
+            page.call("Input.dispatchMouseEvent", {
                 "type": kind, "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1,
             })
     elif action == "type":
         value = body.get("value")
         if not isinstance(value, str) or len(value) > 2000:
             raise ApiError(400, {"error": "bad_value"})
-        locate(cdp, ref)
-        cdp.evaluate(FOCUS_JS.replace("__REF__", ref))
-        cdp.call("Input.insertText", {"text": value})
+        locate(page, ref)
+        page.evaluate(FOCUS_JS.replace("__REF__", ref))
+        page.call("Input.insertText", {"text": value})
     else:
         code, text = PRESS_KEYS[key]
         base = {"key": key, "code": key, "windowsVirtualKeyCode": code}
         down = {**base, "type": "rawKeyDown"}
         if text:
             down["text"] = text
-        cdp.call("Input.dispatchKeyEvent", down)
-        cdp.call("Input.dispatchKeyEvent", {**base, "type": "keyUp"})
+        page.call("Input.dispatchKeyEvent", down)
+        page.call("Input.dispatchKeyEvent", {**base, "type": "keyUp"})
 
     time.sleep(SETTLE_S)
-    wait_ready(cdp)
-    enforce_after_move(tab_id, cdp)
-    after = read_page(tab_id, cdp, DEFAULT_LIMIT)
+    wait_ready(page)
+    enforce_after_move(tab_id, page)
+    after = read_page(tab_id, page, DEFAULT_LIMIT)
     return {
         "delta": delta(before, REFS.get(tab_id, [])),
         "url": after["url"],
@@ -622,6 +662,12 @@ def route(method, path, qs, body):
         if path == "/permissions":
             return 200, PERMS
     if method == "POST":
+        if path == "/browser/start":
+            ensure_browser()
+            return 200, status()
+        if path == "/browser/stop":
+            stop_browser()
+            return 200, status()
         if path == "/open":
             return 200, open_url(body)
         if path == "/act":
@@ -641,8 +687,7 @@ def route(method, path, qs, body):
             return 200, {"paused": PAUSED}
         if path == "/focus":
             tab_id, _ = tab_connection(body.get("tab"))
-            with urlopen(f"http://{HOST}:{DEBUG_PORT}/json/activate/{tab_id}", timeout=TIMEOUT_S):
-                pass
+            ensure_browser().call("Target.activateTarget", {"targetId": tab_id})
             return 200, {"ok": True}
     raise ApiError(404, {"error": "not found"})
 
@@ -697,8 +742,6 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as error:
             return self._send(error.status, error.body)
         except (CdpError, ConnectionError, OSError, ValueError, KeyError, TypeError, IndexError) as error:
-            with STATE_LOCK:
-                CONNS.clear()  # drop possibly broken sockets, the next call reconnects
             return self._send(502, {"error": "browser_error", "detail": str(error)})
         self._send(status_code, payload)
 
