@@ -74,8 +74,11 @@ def console_text(payload):
 
 def network_text(payload):
     head = f'{payload["url"]} | {len(payload["items"])} requests'
-    lines = [f'{i["method"]} {i["status"] or ""} {i["url"]}' + (f' FAILED {i["failed"]}' if i["failed"] else "")
-             for i in payload["items"]]
+    lines = []
+    for i in payload["items"]:
+        lines.append(f'{i["method"]} {i["status"] or ""} {i["url"]}' + (f' FAILED {i["failed"]}' if i["failed"] else ""))
+        if i.get("body"):
+            lines.append("  body: " + i["body"])
     return "\n".join([head] + lines)
 
 
@@ -139,7 +142,7 @@ TOOLS = [
     },
     {
         "name": "network",
-        "description": "Read the F12 Network list of a tab: recent requests with status codes and failures. Headers and bodies are not shown.",
+        "description": "Read the F12 Network list of a tab: recent requests, status codes, failures and text response bodies (cut and redacted). Headers are not shown.",
         "inputSchema": {"type": "object", "properties": {
             "tab": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}},
         "run": run_network,

@@ -16,7 +16,8 @@ Brave starts when a tool needs it, and it stops when the user asks (POST /browse
                                     -> {delta, url, title, loginWall}
                                        or 409 approval_required / stale_ref, 403 origin_not_granted
   GET  /console?tab=ID&limit=N      -> recent console messages and errors (F12 Console)
-  GET  /network?tab=ID&limit=N      -> recent requests with status (F12 Network). No headers or bodies.
+  GET  /network?tab=ID&limit=N      -> recent requests with status and text response bodies (F12 Network).
+                                       Bodies are cut to 4000 characters, and personal numbers, e-mails and tokens are removed.
   GET  /screenshot?tab=ID           -> small picture of the tab for the Jarri panel (not for Claude)
   GET  /text?tab=ID&chars=N         -> visible text of the page as lines (prices, descriptions)
   GET  /events, /requests, /approvals, /permissions
@@ -52,6 +53,21 @@ BRAVE_PROFILE = os.path.expanduser(os.environ.get("JARRI_BROWSER_PROFILE", "~/.b
 # Brave opens its own window next to Jarri. Set JARRI_BROWSER_HEADLESS=1 to run it without one.
 BRAVE_HEADLESS = os.environ.get("JARRI_BROWSER_HEADLESS", "0") == "1"
 LOG_LIMIT = 200
+BODY_LIMIT = 4000
+# What is removed from response bodies before Claude or the panel sees them.
+REDACT = [
+    (re.compile(r"\b\d{6,8}[-+]?\d{4}\b"), "[personnummer]"),
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "[e-post]"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1[token]"),
+    (re.compile(r'(?i)("?(?:password|passwd|pw|token|secret|api[_-]?key)"?\s*[:=]\s*)"[^"]*"'), r'\1"[hidden]"'),
+]
+TEXT_TYPES = ("text/", "json", "xml", "javascript")
+
+
+def redact(text):
+    for pattern, replacement in REDACT:
+        text = pattern.sub(replacement, text)
+    return text[:BODY_LIMIT]
 TIMEOUT_S = 10
 INTENT_S = 0.3
 SETTLE_S = 0.4
@@ -299,14 +315,28 @@ class Pipe:
         elif method == "Network.requestWillBeSent":
             request = params.get("request", {})
             requests.append({"id": params.get("requestId"), "method": request.get("method", ""),
-                             "url": request.get("url", "")[:300], "status": None, "failed": None})
-        elif method in ("Network.responseReceived", "Network.loadingFailed"):
+                             "url": request.get("url", "")[:300], "status": None, "failed": None,
+                             "mime": "", "body": None})
+        elif method in ("Network.responseReceived", "Network.loadingFailed", "Network.loadingFinished"):
             for item in list(requests):
                 if item["id"] == params.get("requestId"):
                     if method == "Network.responseReceived":
-                        item["status"] = params.get("response", {}).get("status")
-                    else:
+                        response = params.get("response", {})
+                        item["status"] = response.get("status")
+                        item["mime"] = response.get("mimeType", "")
+                    elif method == "Network.loadingFailed":
                         item["failed"] = params.get("errorText")
+                    elif any(kind in item.get("mime", "") for kind in TEXT_TYPES):
+                        threading.Thread(target=self.fetch_body, args=(session, item), daemon=True).start()
+
+    def fetch_body(self, session, item):
+        """Read a finished text response. Runs in its own thread, because the reader must keep reading."""
+        try:
+            result = self.call("Network.getResponseBody", {"requestId": item["id"]}, session=session)
+        except (CdpError, ConnectionError, OSError):
+            return
+        if not result.get("base64Encoded"):
+            item["body"] = redact(result.get("body", ""))
 
     def _write(self, message):
         with self.write_lock:  # replies and acks may come from the reader thread, keep messages whole
