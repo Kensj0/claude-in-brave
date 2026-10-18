@@ -15,6 +15,7 @@ Brave starts when a tool needs it, and it stops when the user asks (POST /browse
   POST /act {tab, action, ref?, value?, key?, approvalId?}
                                     -> {delta, url, title, loginWall}
                                        or 409 approval_required / stale_ref, 403 origin_not_granted
+  GET  /screenshot?tab=ID           -> small picture of the tab for the Jarri panel (not for Claude)
   GET  /text?tab=ID&chars=N         -> visible text of the page as lines (prices, descriptions)
   GET  /events, /requests, /approvals, /permissions
   POST /permissions {origin, hours?}      hours null/absent = until revoked
@@ -548,6 +549,18 @@ def read_text(tab, chars):
             "total": result["total"], "truncated": result["truncated"]}
 
 
+def screenshot(tab):
+    """A small picture of the tab, for the Jarri panel only. No MCP tool returns it to Claude."""
+    tab_id, page = tab_connection(tab)
+    size = page.evaluate("({ width: innerWidth, height: innerHeight })")
+    shot = page.call("Page.captureScreenshot", {
+        "format": "jpeg", "quality": 55,
+        "clip": {"x": 0, "y": 0, "width": size["width"], "height": size["height"], "scale": 0.5},
+    })
+    return {"url": current_url(page), "title": page.evaluate("document.title"),
+            "image": "data:image/jpeg;base64," + shot["data"]}
+
+
 def find_ref(tab_id, ref):
     items = REFS.get(tab_id)
     if items is None:
@@ -745,6 +758,8 @@ def route(method, path, qs, body):
         if path == "/digest":
             limit = min(max(int(qs.get("limit", [DEFAULT_LIMIT])[0]), 1), MAX_LIMIT)
             return 200, digest(qs.get("tab", [None])[0], limit)
+        if path == "/screenshot":
+            return 200, screenshot(qs.get("tab", [None])[0])
         if path == "/text":
             chars = min(max(int(qs.get("chars", [6000])[0]), 500), 20000)
             return 200, read_text(qs.get("tab", [None])[0], chars)
