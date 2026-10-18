@@ -47,6 +47,8 @@ STATE_DIR = os.path.expanduser(os.environ.get("JARRI_BROWSER_STATE", "~/.local/s
 PERMISSIONS_FILE = os.path.join(STATE_DIR, "permissions.json")
 BRAVE_BIN = os.environ.get("JARRI_BRAVE_BIN", "/opt/brave.com/brave/brave")
 BRAVE_PROFILE = os.path.expanduser(os.environ.get("JARRI_BROWSER_PROFILE", "~/.brave-claude"))
+# Brave runs without its own window. Jarri's Brave panel shows the page and sends input to it.
+BRAVE_HEADLESS = os.environ.get("JARRI_BROWSER_HEADLESS", "1") == "1"
 TIMEOUT_S = 10
 INTENT_S = 0.3
 SETTLE_S = 0.4
@@ -404,7 +406,8 @@ def ensure_browser():
     with open(os.path.join(STATE_DIR, "brave.log"), "ab") as errors:
         proc = subprocess.Popen(
             [BRAVE_BIN, "--remote-debugging-pipe", f"--user-data-dir={BRAVE_PROFILE}",
-             "--no-first-run", "--no-default-browser-check", "about:blank"],
+             "--no-first-run", "--no-default-browser-check"]
+            + (["--headless=new"] if BRAVE_HEADLESS else []) + ["about:blank"],
             close_fds=False, preexec_fn=child_setup,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
         )
@@ -575,6 +578,71 @@ def screenshot(tab):
     frame = BROWSER.frames.get(page.session)
     return {"url": current_url(page), "title": page.evaluate("document.title"),
             "image": "data:image/jpeg;base64," + frame if frame else None}
+
+
+def user_navigate(body):
+    """The user types an address in Jarri's Brave panel. This is the user, so no origin check."""
+    url = body.get("url", "")
+    if urlparse(url).scheme not in ("http", "https"):
+        raise ApiError(400, {"error": "only http and https"})
+    tab_id, page = tab_connection(body.get("tab") or None)
+    result = page.call("Page.navigate", {"url": url})
+    if result.get("errorText"):
+        raise ApiError(502, {"error": "navigation_failed", "detail": result["errorText"]})
+    wait_ready(page)
+    REFS.pop(tab_id, None)
+    log("open", f"Du öppnade {url}")
+    return {"ok": True}
+
+
+def user_back(body):
+    _, page = tab_connection(body.get("tab") or None)
+    page.evaluate("history.back()")
+    return {"ok": True}
+
+
+KEY_CODES = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, "Delete": 46,
+             "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40}
+
+
+def user_input(body):
+    """Clicks, scrolling, typing and keys from Jarri's Brave panel. Positions are 0-1 of the picture."""
+    _, page = tab_connection(body.get("tab") or None)
+    kind = body.get("type")
+    if kind == "mouse":
+        size = page.evaluate("({ width: innerWidth, height: innerHeight })")
+        x = min(max(float(body["x"]), 0), 1) * size["width"]
+        y = min(max(float(body["y"]), 0), 1) * size["height"]
+        event = body.get("event")
+        if event == "wheel":
+            page.call("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y,
+                                                  "deltaX": 0, "deltaY": float(body.get("deltaY", 0))})
+        elif event == "move":
+            page.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        elif event in ("down", "up"):
+            kind_name = "mousePressed" if event == "down" else "mouseReleased"
+            page.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+            page.call("Input.dispatchMouseEvent", {"type": kind_name, "x": x, "y": y,
+                                                  "button": "left", "clickCount": 1})
+        else:
+            raise ApiError(400, {"error": "bad_mouse_event"})
+    elif kind == "text":
+        value = str(body.get("value", ""))[:200]
+        page.call("Input.insertText", {"text": value})
+    elif kind == "key":
+        key = body.get("key")
+        if key not in KEY_CODES:
+            raise ApiError(400, {"error": "bad_key"})
+        code = KEY_CODES[key]
+        base = {"key": key, "code": key, "windowsVirtualKeyCode": code}
+        down = {**base, "type": "rawKeyDown"}
+        if key == "Enter":
+            down["text"] = "\r"
+        page.call("Input.dispatchKeyEvent", down)
+        page.call("Input.dispatchKeyEvent", {**base, "type": "keyUp"})
+    else:
+        raise ApiError(400, {"error": "bad_input"})
+    return {"ok": True}
 
 
 def find_ref(tab_id, ref):
@@ -791,6 +859,12 @@ def route(method, path, qs, body):
         if path == "/browser/start":
             ensure_browser()
             return 200, status()
+        if path == "/navigate":
+            return 200, user_navigate(body)
+        if path == "/navigate/back":
+            return 200, user_back(body)
+        if path == "/input":
+            return 200, user_input(body)
         if path == "/browser/stop":
             stop_browser()
             return 200, status()
