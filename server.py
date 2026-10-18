@@ -136,7 +136,7 @@ RESOLVE_JS = """(() => {
   const frame = document.createElement('div');
   frame.style.cssText = `position:fixed;left:${r.left - 4}px;top:${r.top - 4}px;width:${r.width + 8}px;height:${r.height + 8}px;border:3px solid #7c3aed;border-radius:6px;pointer-events:none;z-index:2147483647`;
   const tag = document.createElement('div');
-  tag.textContent = 'Claude arbetar här';
+  tag.textContent = 'Claude is working here';
   tag.style.cssText = `position:fixed;left:${r.left}px;top:${Math.max(0, r.top - 28)}px;background:#7c3aed;color:#fff;font:12px system-ui,sans-serif;padding:3px 8px;border-radius:4px;pointer-events:none;z-index:2147483647`;
   document.body.append(frame, tag);
   setTimeout(() => { frame.remove(); tag.remove(); }, 1500);
@@ -160,7 +160,7 @@ BAR_JS = """(() => {
   bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;display:flex;align-items:center;gap:8px;padding:6px 12px;background:#1e1b2e;color:#fff;font:13px system-ui,sans-serif;box-shadow:0 -2px 8px rgba(0,0,0,.3)';
   const text = document.createElement('span');
   text.style.cssText = 'flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis';
-  text.textContent = 'Claude väntar';
+  text.textContent = 'Claude is waiting';
   const button = (label, cmd) => {
     const b = document.createElement('button');
     b.textContent = label;
@@ -415,7 +415,7 @@ def ensure_browser():
     os.close(resp_w)
     CONNS.clear()
     BROWSER = Pipe(proc, cmd_w, resp_r)
-    log("browser", "Brave startad")
+    log("browser", "Brave started")
     return BROWSER
 
 
@@ -431,7 +431,7 @@ def stop_browser():
     BROWSER = None
     CONNS.clear()
     REFS.clear()
-    log("browser", "Brave stoppad")
+    log("browser", "Brave stopped")
 
 
 atexit.register(stop_browser)
@@ -439,9 +439,9 @@ atexit.register(stop_browser)
 
 def bar_text():
     if PAUSED:
-        return "Claude är pausad"
+        return "Claude is paused"
     intents = [e for e in EVENTS if e["type"] == "intent"]
-    return intents[-1]["text"] if intents else "Claude väntar"
+    return intents[-1]["text"] if intents else "Claude is waiting"
 
 
 def bar_update():
@@ -458,11 +458,11 @@ def bar_command(cmd):
     global PAUSED
     if cmd == "stop":
         PAUSED = True
-        log("pause", "Stoppad från fältet i Brave")
+        log("pause", "Stopped from the bar in Brave")
         stop_browser()
         return
     PAUSED = cmd != "play"
-    log("pause", "Pausad från fältet i Brave" if PAUSED else "Igång igen från fältet i Brave")
+    log("pause", "Paused from the bar in Brave" if PAUSED else "Running again from the bar in Brave")
     bar_update()
 
 
@@ -522,7 +522,7 @@ def enforce_after_move(tab_id, page):
     page.evaluate("history.back()")  # undo the move to a page Claude may not use
     REFS.pop(tab_id, None)
     rid = add_request(origin, url, "access")
-    log("blocked", f"Blockerade {origin}")
+    log("blocked", f"Blocked {origin}")
     raise ApiError(403, {"error": "origin_not_granted", "origin": origin, "requestId": rid})
 
 
@@ -553,7 +553,7 @@ def read_page(tab_id, page, limit):
     origin = origin_of(result["url"])
     if result["loginWall"] and origin:
         add_request(origin, result["url"], "login")
-        log("login", f"Inloggning krävs på {origin}")
+        log("login", f"Log in needed on {origin}")
     return {
         "status": "awaiting_login" if result["loginWall"] else "ok",
         "url": result["url"],
@@ -591,7 +591,7 @@ def user_navigate(body):
         raise ApiError(502, {"error": "navigation_failed", "detail": result["errorText"]})
     wait_ready(page)
     REFS.pop(tab_id, None)
-    log("open", f"Du öppnade {url}")
+    log("open", f"You opened {url}")
     return {"ok": True}
 
 
@@ -706,7 +706,7 @@ def open_url(body):
     result = page.call("Page.navigate", {"url": url})
     if result.get("errorText"):
         raise ApiError(502, {"error": "navigation_failed", "detail": result["errorText"]})
-    log("open", f"Öppnar {url}")
+    log("open", f"Opening {url}")
     wait_ready(page)
     enforce_after_move(tab_id, page)
     return read_page(tab_id, page, DEFAULT_LIMIT)
@@ -723,7 +723,7 @@ def require_approval(tab_id, ref, label, action, approval_id):
         "id": approval_id, "tab": tab_id, "ref": ref, "label": label,
         "action": action, "approved": False, "at": int(time.time()),
     }
-    log("approval", f'Väntar på godkännande: {action} "{label}"')
+    log("approval", f'Waiting for approval: {action} "{label}"')
     raise ApiError(409, {"error": "approval_required", "approvalId": approval_id, "label": label})
 
 
@@ -738,7 +738,7 @@ def act(body):
         key = body.get("key")
         if key not in PRESS_KEYS:
             raise ApiError(400, {"error": "bad_key", "allowed": list(PRESS_KEYS)})
-        label = f"tangent {key}"
+        label = f"key {key}"
         if key == "Enter":
             context = page.evaluate(FOCUSED_JS) or ""
             if RISKY.search(context):
@@ -758,7 +758,7 @@ def act(body):
     else:
         raise ApiError(400, {"error": "bad_action"})
 
-    log("intent", f"Nästa: {action} {label}")
+    log("intent", f"Next: {action} {label}")
     bar_update()
     time.sleep(INTENT_S)
     check_paused()
@@ -807,7 +807,7 @@ def grant(body):
     PERMS[origin] = {"until": None if hours is None else time.time() + hours * 3600}
     save_permissions()
     REQUESTS[:] = [r for r in REQUESTS if r["origin"] != origin]
-    log("permission", f"Åtkomst beviljad: {origin}")
+    log("permission", f"Access granted: {origin}")
     return {"ok": True, "origin": origin}
 
 
@@ -815,7 +815,7 @@ def revoke(body):
     origin = body.get("origin", "")
     PERMS.pop(origin, None)
     save_permissions()
-    log("permission", f"Åtkomst återkallad: {origin}")
+    log("permission", f"Access removed: {origin}")
     return {"ok": True}
 
 
@@ -825,10 +825,10 @@ def decide(body):
         raise ApiError(404, {"error": "no_such_approval"})
     if body.get("approve"):
         approval["approved"] = True
-        log("approval", f'Godkänd: {approval["action"]} "{approval["label"]}"')
+        log("approval", f'Approved: {approval["action"]} "{approval["label"]}"')
     else:
         del APPROVALS[approval["id"]]
-        log("approval", f'Nekad: {approval["action"]} "{approval["label"]}"')
+        log("approval", f'Denied: {approval["action"]} "{approval["label"]}"')
     return {"ok": True}
 
 
@@ -883,7 +883,7 @@ def route(method, path, qs, body):
             return 200, {"ok": True}
         if path == "/pause":
             PAUSED = bool(body.get("on"))
-            log("pause", "Pausad" if PAUSED else "Igång igen")
+            log("pause", "Paused" if PAUSED else "Running again")
             bar_update()
             return 200, {"paused": PAUSED}
         if path == "/focus":
