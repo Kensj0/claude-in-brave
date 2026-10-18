@@ -55,14 +55,23 @@ SETTLE_S = 0.4
 DEFAULT_LIMIT = 60
 MAX_LIMIT = 200
 # Clicks or Enter presses whose label or form text matches this need the user's approval.
+# Swedish words match as a prefix ("köp" also finds "köpa"). English words must be whole words,
+# so "pay" does not match "display".
+RISKY_SV = (
+    r"köp|betal|faktura|prenumer|uppgradera|logga in|logga ut|lösenord|verifiera|säkerhet|"
+    r"api[- ]?nyckel|behörighet|skicka|radera|ta bort|avaktivera|återkalla|publicera|dela|bekräfta|"
+    r"ladda ner|exportera|hämta|ladda upp|välj fil|bifoga|spara som"
+)
+RISKY_EN = (
+    r"pay|payment|checkout|buy|purchase|order|place order|transfer|withdraw|deposit|"
+    r"subscribe|unsubscribe|upgrade|cancel|"
+    r"log ?in|log ?out|sign ?in|sign ?out|password|2fa|verify|security|api[- ]?key|token|secret|"
+    r"permission|authori[sz]e|approve|allow|revoke|disable|"
+    r"send|submit|delete|remove|close account|unlink|invite|publish|deploy|share|confirm|"
+    r"download|export|upload|choose file|attach|save as"
+)
 RISKY = re.compile(
-    r"köp|betala|betalning|pay|checkout|faktura|invoice|"
-    r"prenumer|subscribe|upgrade|uppgradera|"
-    r"logga in|logga ut|log ?in|log ?out|sign ?in|sign ?out|lösenord|password|2fa|verifiera|verify|"
-    r"säkerhet|security|api[- ]?nyckel|api[- ]?key|token|secret|behörighet|permission|"
-    r"skicka|send|submit|radera|ta bort|delete|remove|avaktivera|disable|återkalla|revoke|"
-    r"publicera|publish|deploy|dela|share|bekräfta|confirm|"
-    r"ladda ner|download|exportera|export|hämta|ladda upp|upload|välj fil|choose file|bifoga|attach|spara som|save as",
+    rf"{RISKY_SV}|\b(?:{RISKY_EN})\b",
     re.IGNORECASE,
 )
 PRESS_KEYS = {"Enter": (13, "\r"), "Tab": (9, ""), "Escape": (27, "")}
