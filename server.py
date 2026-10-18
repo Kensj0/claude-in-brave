@@ -56,7 +56,8 @@ RISKY = re.compile(
     r"logga in|logga ut|log ?in|log ?out|sign ?in|sign ?out|lösenord|password|2fa|verifiera|verify|"
     r"säkerhet|security|api[- ]?nyckel|api[- ]?key|token|secret|behörighet|permission|"
     r"skicka|send|submit|radera|ta bort|delete|remove|avaktivera|disable|återkalla|revoke|"
-    r"publicera|publish|deploy|dela|share|bekräfta|confirm",
+    r"publicera|publish|deploy|dela|share|bekräfta|confirm|"
+    r"ladda ner|download|exportera|export|hämta|ladda upp|upload|välj fil|choose file|bifoga|attach|spara som|save as",
     re.IGNORECASE,
 )
 PRESS_KEYS = {"Enter": (13, "\r"), "Tab": (9, ""), "Escape": (27, "")}
@@ -94,6 +95,7 @@ DIGEST_JS = """(() => {
     if (t === 'INPUT') {
       const ty = (el.type || 'text').toLowerCase();
       if (ty === 'password') return 'password';
+      if (ty === 'file') return 'file';
       if (['submit', 'button', 'reset', 'image'].includes(ty)) return 'button';
       if (ty === 'checkbox' || ty === 'radio' || ty === 'range') return ty === 'range' ? 'slider' : ty;
       return 'textbox';
@@ -344,7 +346,9 @@ def tab_connection(tab_id):
     if target is None:
         raise ApiError(404, {"error": "no_such_tab"})
     if target["id"] not in CONNS:
-        CONNS[target["id"]] = Cdp(target["webSocketDebuggerUrl"])
+        conn = Cdp(target["webSocketDebuggerUrl"])
+        conn.call("Page.setDownloadBehavior", {"behavior": "deny"})  # no files leave or land on disk
+        CONNS[target["id"]] = conn
     return target["id"], CONNS[target["id"]]
 
 
@@ -516,6 +520,8 @@ def act(body):
         if not ref.isdigit():
             raise ApiError(400, {"error": "bad_ref"})
         item = find_ref(tab_id, ref)
+        if item["kind"] == "file":  # file pickers would hand over the user's own photos and files
+            raise ApiError(403, {"error": "file_transfer_not_allowed"})
         if action == "type" and item["kind"] not in ("textbox", "textarea"):
             raise ApiError(403, {"error": "not_typeable", "kind": item["kind"]})
         label = f'{item["kind"]} "{item["label"]}"'
