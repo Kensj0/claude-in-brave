@@ -220,8 +220,10 @@ class Pipe:
         self.resp_r = resp_r
         self.next_id = 0
         self.pending = {}
+        self.frames = {}  # page session -> latest JPEG from Brave's screencast (base64)
         self.closed = False
         self.cond = threading.Condition()
+        self.write_lock = threading.Lock()
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
@@ -246,10 +248,25 @@ class Pipe:
                     with self.cond:
                         self.pending[message["id"]] = message
                         self.cond.notify_all()
+                elif message.get("method") == "Page.screencastFrame":
+                    params = message["params"]
+                    self.frames[message["sessionId"]] = params["data"]
+                    self.send_no_wait("Page.screencastFrameAck", {"sessionId": params["sessionId"]},
+                                      message["sessionId"])
                 elif message.get("method") == "Runtime.bindingCalled":
                     params = message.get("params", {})
                     if params.get("name") == "jarriControl":  # a button on the control bar was pressed
                         threading.Thread(target=bar_command, args=(params.get("payload", ""),), daemon=True).start()
+
+    def _write(self, message):
+        with self.write_lock:  # replies and acks may come from the reader thread, keep messages whole
+            os.write(self.cmd_w, json.dumps(message).encode() + b"\0")
+
+    def send_no_wait(self, method, params, session):
+        with self.cond:
+            self.next_id += 1
+            mid = self.next_id
+        self._write({"id": mid, "method": method, "params": params, "sessionId": session})
 
     def call(self, method, params=None, session=None):
         with self.cond:
@@ -260,7 +277,7 @@ class Pipe:
         message = {"id": mid, "method": method, "params": params or {}}
         if session:
             message["sessionId"] = session
-        os.write(self.cmd_w, json.dumps(message).encode() + b"\0")
+        self._write(message)
         with self.cond:
             end = time.time() + TIMEOUT_S
             while mid not in self.pending:
@@ -468,6 +485,9 @@ def tab_connection(tab_id):
         session = pipe.call("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
         page = Page(pipe, session)
         page.call("Page.setDownloadBehavior", {"behavior": "deny"})  # no files leave or land on disk
+        # Brave sends a frame when the page changes; the panel reads the latest one. Nothing is polled.
+        page.call("Page.startScreencast", {"format": "jpeg", "quality": 55, "maxWidth": 960,
+                                           "maxHeight": 600, "everyNthFrame": 1})
         page.call("Runtime.addBinding", {"name": "jarriControl"})
         page.call("Page.addScriptToEvaluateOnNewDocument", {"source": BAR_JS})
         page.evaluate(BAR_JS)
@@ -550,15 +570,11 @@ def read_text(tab, chars):
 
 
 def screenshot(tab):
-    """A small picture of the tab, for the Jarri panel only. No MCP tool returns it to Claude."""
+    """The latest frame of the tab, for the Jarri panel only. No MCP tool returns it to Claude."""
     tab_id, page = tab_connection(tab)
-    size = page.evaluate("({ width: innerWidth, height: innerHeight })")
-    shot = page.call("Page.captureScreenshot", {
-        "format": "jpeg", "quality": 55,
-        "clip": {"x": 0, "y": 0, "width": size["width"], "height": size["height"], "scale": 0.5},
-    })
+    frame = BROWSER.frames.get(page.session)
     return {"url": current_url(page), "title": page.evaluate("document.title"),
-            "image": "data:image/jpeg;base64," + shot["data"]}
+            "image": "data:image/jpeg;base64," + frame if frame else None}
 
 
 def find_ref(tab_id, ref):
