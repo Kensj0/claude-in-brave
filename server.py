@@ -15,6 +15,8 @@ Brave starts when a tool needs it, and it stops when the user asks (POST /browse
   POST /act {tab, action, ref?, value?, key?, approvalId?}
                                     -> {delta, url, title, loginWall}
                                        or 409 approval_required / stale_ref, 403 origin_not_granted
+  GET  /console?tab=ID&limit=N      -> recent console messages and errors (F12 Console)
+  GET  /network?tab=ID&limit=N      -> recent requests with status (F12 Network). No headers or bodies.
   GET  /screenshot?tab=ID           -> small picture of the tab for the Jarri panel (not for Claude)
   GET  /text?tab=ID&chars=N         -> visible text of the page as lines (prices, descriptions)
   GET  /events, /requests, /approvals, /permissions
@@ -47,8 +49,9 @@ STATE_DIR = os.path.expanduser(os.environ.get("JARRI_BROWSER_STATE", "~/.local/s
 PERMISSIONS_FILE = os.path.join(STATE_DIR, "permissions.json")
 BRAVE_BIN = os.environ.get("JARRI_BRAVE_BIN", "/opt/brave.com/brave/brave")
 BRAVE_PROFILE = os.path.expanduser(os.environ.get("JARRI_BROWSER_PROFILE", "~/.brave-claude"))
-# Brave runs without its own window. Jarri's Brave panel shows the page and sends input to it.
-BRAVE_HEADLESS = os.environ.get("JARRI_BROWSER_HEADLESS", "1") == "1"
+# Brave opens its own window next to Jarri. Set JARRI_BROWSER_HEADLESS=1 to run it without one.
+BRAVE_HEADLESS = os.environ.get("JARRI_BROWSER_HEADLESS", "0") == "1"
+LOG_LIMIT = 200
 TIMEOUT_S = 10
 INTENT_S = 0.3
 SETTLE_S = 0.4
@@ -232,6 +235,8 @@ class Pipe:
         self.next_id = 0
         self.pending = {}
         self.frames = {}  # page session -> latest JPEG from Brave's screencast (base64)
+        self.logs = {}     # page session -> recent console messages and errors (F12 Console)
+        self.network = {}  # page session -> recent requests and their status (F12 Network)
         self.closed = False
         self.cond = threading.Condition()
         self.write_lock = threading.Lock()
@@ -255,6 +260,8 @@ class Pipe:
                 if not raw:
                     continue
                 message = json.loads(raw)
+                if "id" not in message:
+                    self.record(message)
                 if "id" in message:
                     with self.cond:
                         self.pending[message["id"]] = message
@@ -268,6 +275,38 @@ class Pipe:
                     params = message.get("params", {})
                     if params.get("name") == "jarriControl":  # a button on the control bar was pressed
                         threading.Thread(target=bar_command, args=(params.get("payload", ""),), daemon=True).start()
+
+    def record(self, message):
+        """Keep what the F12 Console and Network tabs show. Headers, cookies and bodies are not kept."""
+        method = message.get("method", "")
+        session = message.get("sessionId")
+        if not session or not method.startswith(("Runtime.", "Log.", "Network.")):
+            return
+        params = message.get("params", {})
+        logs = self.logs.setdefault(session, deque(maxlen=LOG_LIMIT))
+        requests = self.network.setdefault(session, deque(maxlen=LOG_LIMIT))
+        if method == "Runtime.consoleAPICalled":
+            text = " ".join(str(arg.get("value", arg.get("description", ""))) for arg in params.get("args", []))
+            logs.append({"level": params.get("type", "log"), "text": text[:500]})
+        elif method == "Runtime.exceptionThrown":
+            details = params.get("exceptionDetails", {})
+            text = (details.get("exception", {}).get("description") or details.get("text", ""))
+            logs.append({"level": "error", "text": text[:500]})
+        elif method == "Log.entryAdded":
+            entry = params.get("entry", {})
+            logs.append({"level": entry.get("level", "info"), "text": entry.get("text", "")[:500],
+                         "url": entry.get("url", "")[:300]})
+        elif method == "Network.requestWillBeSent":
+            request = params.get("request", {})
+            requests.append({"id": params.get("requestId"), "method": request.get("method", ""),
+                             "url": request.get("url", "")[:300], "status": None, "failed": None})
+        elif method in ("Network.responseReceived", "Network.loadingFailed"):
+            for item in list(requests):
+                if item["id"] == params.get("requestId"):
+                    if method == "Network.responseReceived":
+                        item["status"] = params.get("response", {}).get("status")
+                    else:
+                        item["failed"] = params.get("errorText")
 
     def _write(self, message):
         with self.write_lock:  # replies and acks may come from the reader thread, keep messages whole
@@ -497,6 +536,8 @@ def tab_connection(tab_id):
         session = pipe.call("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
         page = Page(pipe, session)
         page.call("Page.setDownloadBehavior", {"behavior": "deny"})  # no files leave or land on disk
+        for domain in ("Runtime", "Log", "Network"):  # for the console and network reads
+            page.call(f"{domain}.enable")
         # Brave sends a frame when the page changes; the panel reads the latest one. Nothing is polled.
         page.call("Page.startScreencast", {"format": "jpeg", "quality": 55, "maxWidth": 960,
                                            "maxHeight": 600, "everyNthFrame": 1})
@@ -652,6 +693,14 @@ def user_input(body):
     else:
         raise ApiError(400, {"error": "bad_input"})
     return {"ok": True}
+
+
+def page_log(tab, source, limit):
+    """Recent console messages or network requests of a granted tab. Read-only, for Claude and the user."""
+    tab_id, page = tab_connection(tab)
+    ensure_granted(current_url(page))
+    records = BROWSER.logs if source == "console" else BROWSER.network
+    return {"url": current_url(page), "items": list(records.get(page.session, []))[-limit:]}
 
 
 def find_ref(tab_id, ref):
@@ -851,6 +900,9 @@ def route(method, path, qs, body):
         if path == "/digest":
             limit = min(max(int(qs.get("limit", [DEFAULT_LIMIT])[0]), 1), MAX_LIMIT)
             return 200, digest(qs.get("tab", [None])[0], limit)
+        if path in ("/console", "/network"):
+            limit = min(max(int(qs.get("limit", [50])[0]), 1), LOG_LIMIT)
+            return 200, page_log(qs.get("tab", [None])[0], path[1:], limit)
         if path == "/screenshot":
             return 200, screenshot(qs.get("tab", [None])[0])
         if path == "/text":

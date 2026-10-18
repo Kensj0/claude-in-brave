@@ -59,6 +59,26 @@ def text_text(payload):
     return "\n".join([head] + payload["lines"])
 
 
+def run_console(args):
+    return call_service("GET", f'/console?limit={int(args.get("limit", 50))}' + (f'&tab={args["tab"]}' if args.get("tab") else ""))
+
+
+def run_network(args):
+    return call_service("GET", f'/network?limit={int(args.get("limit", 50))}' + (f'&tab={args["tab"]}' if args.get("tab") else ""))
+
+
+def console_text(payload):
+    head = f'{payload["url"]} | {len(payload["items"])} messages'
+    return "\n".join([head] + [f'[{i["level"]}] {i["text"]}' for i in payload["items"]])
+
+
+def network_text(payload):
+    head = f'{payload["url"]} | {len(payload["items"])} requests'
+    lines = [f'{i["method"]} {i["status"] or ""} {i["url"]}' + (f' FAILED {i["failed"]}' if i["failed"] else "")
+             for i in payload["items"]]
+    return "\n".join([head] + lines)
+
+
 def run_open(args):
     return call_service("POST", "/open", {"url": args["url"], "tab": args.get("tab")})
 
@@ -108,6 +128,22 @@ TOOLS = [
             "tab": {"type": "string"}, "chars": {"type": "integer", "minimum": 500, "maximum": 20000}}},
         "run": run_text,
         "text": text_text,
+    },
+    {
+        "name": "console",
+        "description": "Read the F12 Console of a tab: recent messages, warnings and errors. Use it to find out why a page fails.",
+        "inputSchema": {"type": "object", "properties": {
+            "tab": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}},
+        "run": run_console,
+        "text": console_text,
+    },
+    {
+        "name": "network",
+        "description": "Read the F12 Network list of a tab: recent requests with status codes and failures. Headers and bodies are not shown.",
+        "inputSchema": {"type": "object", "properties": {
+            "tab": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}},
+        "run": run_network,
+        "text": network_text,
     },
     {
         "name": "open",
