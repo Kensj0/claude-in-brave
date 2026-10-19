@@ -655,6 +655,10 @@ def read_text(tab, chars):
 
 def screenshot(tab):
     """The latest frame of the tab, for a panel only. No MCP tool returns it to Claude."""
+    # The panel asks for a picture every half second. Asking must never start Brave, so nothing is
+    # started here: with no running Brave there is simply no picture yet.
+    if BROWSER is None or BROWSER.closed:
+        return {"url": "", "title": "", "image": None}
     tab_id, page = tab_connection(tab)
     frame = BROWSER.frames.get(page.session)
     # URL and title come from the browser's own target list. Running a script in the page here could
