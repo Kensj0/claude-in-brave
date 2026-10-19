@@ -38,6 +38,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1035,6 +1036,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, {"error": "bad json"})
 
     def _dispatch(self, method):
+        # TEMP DEBUG: logs every incoming request so we can see what the Jarri panel sends. Remove after.
+        print(f"DEBUG {time.strftime('%T')} {method} {self.path} origin={self.headers.get('Origin')} host={self.headers.get('Host')}", file=sys.stderr, flush=True)
         if not self._allowed():
             return self._send(403, {"error": "forbidden origin"})
         url = urlparse(self.path)
