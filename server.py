@@ -228,6 +228,13 @@ FOCUS_JS = """(() => {
   if (!el) return false;
   el.focus();
   if (el.select) el.select();
+  else {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
   return true;
 })()"""
 
