@@ -1014,6 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _send(self, status_code, body):
+        print(f"DEBUG   -> {status_code} in {time.time() - getattr(self, '_t0', time.time()):.3f}s", file=sys.stderr, flush=True)  # TEMP
         self.send_response(status_code)
         self._cors()
         raw = json.dumps(body).encode()
@@ -1037,6 +1038,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         # TEMP DEBUG: logs every incoming request so we can see what the Jarri panel sends. Remove after.
+        self._t0 = time.time()
         print(f"DEBUG {time.strftime('%T')} {method} {self.path} origin={self.headers.get('Origin')} host={self.headers.get('Host')}", file=sys.stderr, flush=True)
         if not self._allowed():
             return self._send(403, {"error": "forbidden origin"})
