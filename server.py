@@ -1011,8 +1011,11 @@ class Handler(BaseHTTPRequestHandler):
         raw = json.dumps(body).encode()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client left before the answer; nothing to do
 
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)
