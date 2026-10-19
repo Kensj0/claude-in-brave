@@ -1,6 +1,7 @@
-"""Jarri browser service: Claude's access to Brave, with access control and a visible action log.
+"""Claude in Brave: Claude's access to Brave, with access control and a visible action log.
 
-Backend only. Jarri's browser panel is a client of this service.
+Runs on its own: start it in a terminal with `python3 server.py`. Any client can use it, for example
+mcp.py for Claude Code. A visual panel is optional and not needed.
 The service starts Brave itself, with --remote-debugging-pipe. The debug channel is a pipe between
 this process and Brave, not a network port, so no other program can connect to Brave through it.
 Brave starts when a tool needs it, and it stops when the user asks (POST /browser/stop).
@@ -18,7 +19,7 @@ Brave starts when a tool needs it, and it stops when the user asks (POST /browse
   GET  /console?tab=ID&limit=N      -> recent console messages and errors (F12 Console)
   GET  /network?tab=ID&limit=N      -> recent requests with status and text response bodies (F12 Network).
                                        Bodies are cut to 4000 characters, and personal numbers, e-mails and tokens are removed.
-  GET  /screenshot?tab=ID           -> small picture of the tab for the Jarri panel (not for Claude)
+  GET  /screenshot?tab=ID           -> small picture of the tab for a panel (not for Claude)
   GET  /text?tab=ID&chars=N         -> visible text of the page as lines (prices, descriptions)
   GET  /events, /requests, /approvals, /permissions
   POST /permissions {origin, hours?}      hours null/absent = until revoked
@@ -50,7 +51,7 @@ STATE_DIR = os.path.expanduser(os.environ.get("JARRI_BROWSER_STATE", "~/.local/s
 PERMISSIONS_FILE = os.path.join(STATE_DIR, "permissions.json")
 BRAVE_BIN = os.environ.get("JARRI_BRAVE_BIN", "/opt/brave.com/brave/brave")
 BRAVE_PROFILE = os.path.expanduser(os.environ.get("JARRI_BROWSER_PROFILE", "~/.brave-claude"))
-# Brave opens its own window next to Jarri. Set JARRI_BROWSER_HEADLESS=1 to run it without one.
+# Brave opens its own window. Set JARRI_BROWSER_HEADLESS=1 to run it without one.
 BRAVE_HEADLESS = os.environ.get("JARRI_BROWSER_HEADLESS", "0") == "1"
 LOG_LIMIT = 200
 BODY_LIMIT = 4000
@@ -653,7 +654,7 @@ def read_text(tab, chars):
 
 
 def screenshot(tab):
-    """The latest frame of the tab, for the Jarri panel only. No MCP tool returns it to Claude."""
+    """The latest frame of the tab, for a panel only. No MCP tool returns it to Claude."""
     tab_id, page = tab_connection(tab)
     frame = BROWSER.frames.get(page.session)
     return {"url": current_url(page), "title": page.evaluate("document.title"),
@@ -661,7 +662,7 @@ def screenshot(tab):
 
 
 def user_navigate(body):
-    """The user types an address in Jarri's Brave panel. This is the user, so no origin check."""
+    """The user types an address in the panel or the terminal. This is the user, so no origin check."""
     url = body.get("url", "")
     if urlparse(url).scheme not in ("http", "https"):
         raise ApiError(400, {"error": "only http and https"})
@@ -686,7 +687,7 @@ KEY_CODES = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, "Delete": 46,
 
 
 def user_input(body):
-    """Clicks, scrolling, typing and keys from Jarri's Brave panel. Positions are 0-1 of the picture."""
+    """Clicks, scrolling, typing and keys from a panel. Positions are 0-1 of the picture."""
     _, page = tab_connection(body.get("tab") or None)
     kind = body.get("type")
     if kind == "mouse":
@@ -985,7 +986,7 @@ def route(method, path, qs, body):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "jarri-browser"
+    server_version = "claude-in-brave"
 
     def log_message(self, format, *args):
         pass

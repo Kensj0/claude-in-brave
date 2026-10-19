@@ -1,8 +1,10 @@
-"""MCP server that gives Claude the Jarri browser service as tools (stdio, stdlib only).
+"""MCP server that gives Claude the Claude in Brave service as tools (stdio, stdlib only).
+
+Start the service first (python3 server.py). Works the same with or without Jarri.
 
 Claude can read tabs and pages, open pages it may use, act on them, read requests, permissions and
 the event log, and pause. Granting access, revoking it and approving actions are for the user only:
-those are done in the terminal or in Jarri, never through this server.
+those are done in the terminal or in a panel, never through this server.
 """
 
 import json
@@ -24,7 +26,7 @@ def call_service(method, path, body=None):
     except HTTPError as error:
         return error.code, json.loads(error.read() or b"{}")
     except URLError:
-        return 503, {"error": "browser service not reachable", "hint": "systemctl --user start jarri-browser"}
+        return 503, {"error": "browser service not reachable", "hint": "start it in a terminal: python3 server.py"}
 
 
 def as_text(payload):
@@ -223,7 +225,7 @@ for line in sys.stdin:
     if method == "initialize":
         version = message.get("params", {}).get("protocolVersion", PROTOCOL)
         respond(msg_id, {"protocolVersion": version, "capabilities": {"tools": {}},
-                         "serverInfo": {"name": "jarri-browser", "version": "1"}})
+                         "serverInfo": {"name": "claude-in-brave", "version": "1"}})
     elif method == "tools/list":
         respond(msg_id, {"tools": [{k: t[k] for k in ("name", "description", "inputSchema")} for t in TOOLS]})
     elif method == "tools/call":
