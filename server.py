@@ -34,6 +34,7 @@ Binds to 127.0.0.1 only and accepts requests from the same allowed origins as th
 """
 
 import atexit
+import contextlib
 import json
 import os
 import re
@@ -1044,7 +1045,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "forbidden origin"})
         url = urlparse(self.path)
         try:
-            with STATE_LOCK:
+            # Only actions take the lock. Reads (status, events, screenshot...) must not wait behind a
+            # slow action, or the panel's requests time out.
+            with (STATE_LOCK if method == "POST" else contextlib.nullcontext()):
                 body = self._body() if method == "POST" else {}
                 status_code, payload = route(method, url.path, parse_qs(url.query), body)
         except ApiError as error:
