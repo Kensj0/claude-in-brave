@@ -657,7 +657,10 @@ def screenshot(tab):
     """The latest frame of the tab, for a panel only. No MCP tool returns it to Claude."""
     tab_id, page = tab_connection(tab)
     frame = BROWSER.frames.get(page.session)
-    return {"url": current_url(page), "title": page.evaluate("document.title"),
+    # URL and title come from the browser's own target list. Running a script in the page here could
+    # hang on a slow or consent-blocked page and hold up every other request.
+    info = next((t for t in page_list() if t["targetId"] == tab_id), {})
+    return {"url": info.get("url", ""), "title": info.get("title", ""),
             "image": "data:image/jpeg;base64," + frame if frame else None}
 
 
