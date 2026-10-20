@@ -349,8 +349,8 @@ class Pipe:
                         item["mime"] = response.get("mimeType", "")
                     elif method == "Network.loadingFailed":
                         item["failed"] = params.get("errorText")
-                    elif any(kind in item.get("mime", "") for kind in TEXT_TYPES):
-                        threading.Thread(target=self.fetch_body, args=(session, item), daemon=True).start()
+                    # Response bodies are not fetched automatically: on a busy page they flood the pipe
+                    # and freeze every request. Status, URL and type are still recorded.
 
     def fetch_body(self, session, item):
         """Read a finished text response. Runs in its own thread, because the reader must keep reading."""
@@ -621,7 +621,7 @@ def tab_connection(tab_id):
             page.call(f"{domain}.enable")
         # Brave sends a frame when the page changes; the panel reads the latest one. Nothing is polled.
         page.call("Page.startScreencast", {"format": "jpeg", "quality": 55, "maxWidth": 960,
-                                           "maxHeight": 600, "everyNthFrame": 1})
+                                           "maxHeight": 600, "everyNthFrame": 6})
         page.call("Runtime.addBinding", {"name": "jarriControl"})
         page.call("Page.addScriptToEvaluateOnNewDocument", {"source": BAR_JS})
         page.evaluate(BAR_JS)
