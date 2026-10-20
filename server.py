@@ -19,6 +19,9 @@ Brave starts when a tool needs it, and it stops when the user asks (POST /browse
   GET  /console?tab=ID&limit=N      -> recent console messages and errors (F12 Console)
   GET  /network?tab=ID&limit=N      -> recent requests with status and text response bodies (F12 Network).
                                        Bodies are cut to 4000 characters, and personal numbers, e-mails and tokens are removed.
+  GET  /form?tab=ID                 -> every field on the page, with stable names (one read for a whole form)
+  POST /batch {tab, steps}          -> many actions in order: fill, click, check, choose, press, scroll,
+                                       drag, hover, wait. Stops at the first error and says where.
   GET  /screenshot?tab=ID           -> small picture of the tab for a panel (not for Claude)
   GET  /text?tab=ID&chars=N         -> visible text of the page as lines (prices, descriptions)
   GET  /events, /requests, /approvals, /permissions
@@ -591,8 +594,8 @@ def current_url(page):
     return page.evaluate("location.href") or ""
 
 
-def wait_ready(page, timeout=10):
-    time.sleep(0.3)
+def wait_ready(page, timeout=10, first=0.3):
+    time.sleep(first)
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -936,6 +939,316 @@ def decide(body):
     return {"ok": True}
 
 
+# ---- Formulär och batch: en läsning ger alla fält, och många åtgärder går i ett anrop ----
+
+FORM_JS = """(() => {
+  const clean = s => (s || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+  document.querySelectorAll('[data-jarri-name]').forEach(e => e.removeAttribute('data-jarri-name'));
+  const shown = el => {
+    const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+  };
+  const labelOf = el => {
+    const al = el.getAttribute('aria-label');
+    if (al) return clean(al);
+    const lb = el.getAttribute('aria-labelledby');
+    if (lb) return clean(lb.split(/\\s+/).map(id => document.getElementById(id)?.textContent || '').join(' '));
+    if (el.labels && el.labels.length) return clean([...el.labels].map(l => l.textContent).join(' '));
+    if (el.tagName === 'INPUT' && ['submit', 'button', 'reset'].includes(el.type)) return clean(el.value);
+    return clean(el.innerText || el.getAttribute('title') || el.getAttribute('placeholder') || el.getAttribute('name') || '');
+  };
+  const kindOf = el => {
+    const t = el.tagName, role = el.getAttribute('role');
+    if (t === 'INPUT') {
+      const ty = (el.type || 'text').toLowerCase();
+      if (ty === 'password') return 'password';
+      if (ty === 'file') return 'file';
+      if (['submit', 'button', 'reset', 'image'].includes(ty)) return 'button';
+      if (ty === 'checkbox' || ty === 'radio' || ty === 'range') return ty === 'range' ? 'slider' : ty;
+      return 'textbox';
+    }
+    if (t === 'TEXTAREA') return 'textarea';
+    if (t === 'SELECT') return 'select';
+    if (t === 'A') return 'link';
+    if (el.isContentEditable) return 'textbox';
+    if (role === 'checkbox' || role === 'radio' || role === 'switch') return role;
+    return role || (t === 'BUTTON' || t === 'SUMMARY' ? 'button' : t.toLowerCase());
+  };
+  const isChecked = el => el.checked ?? (el.getAttribute('aria-checked') === 'true');
+  const valueOf = (el, kind) => {
+    if (kind === 'password' || kind === 'file') return null;
+    if (kind === 'checkbox' || kind === 'radio' || kind === 'switch') return isChecked(el);
+    if (kind === 'textbox' || kind === 'textarea' || kind === 'slider') return clean(el.value ?? el.textContent);
+    if (kind === 'select') return clean(el.selectedOptions[0]?.textContent || '');
+    return null;
+  };
+  const SEL = 'input:not([type=hidden]),textarea,select,button,a[href],summary,[contenteditable=true],' +
+    '[role=checkbox],[role=radio],[role=switch],[role=combobox],[role=textbox],[role=button],[role=slider],[role=menuitem]';
+  const used = {};
+  const fields = [];
+  for (const el of document.querySelectorAll(SEL)) {
+    if (el.closest('[data-jarri-ui]') || !shown(el)) continue;
+    if (fields.length >= 300) break;
+    const kind = kindOf(el);
+    const base = (labelOf(el) || el.getAttribute('name') || kind).toLowerCase().slice(0, 60);
+    used[base] = (used[base] || 0) + 1;
+    const name = used[base] > 1 ? `${base} #${used[base]}` : base;
+    el.setAttribute('data-jarri-name', name);
+    const f = { name, kind, label: labelOf(el), required: !!(el.required || el.getAttribute('aria-required') === 'true') };
+    if (el.disabled) f.disabled = true;
+    if (kind !== 'button' && kind !== 'link') f.value = valueOf(el, kind);
+    if (kind === 'select') f.options = [...el.options].map(o => clean(o.text)).slice(0, 40);
+    fields.push(f);
+  }
+  return { url: location.href, title: document.title, total: fields.length, fields };
+})()"""
+
+# Finds one field by its stable name. The name is put in as a JSON string.
+FIELD_JS = """(() => {
+  const name = __NAME__;
+  const el = [...document.querySelectorAll('[data-jarri-name]')].find(e => e.getAttribute('data-jarri-name') === name);
+  if (!el) return { missing: true };
+  if (__SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
+  const r = el.getBoundingClientRect();
+  return {
+    x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height,
+    text: (el.getAttribute('aria-label') || el.innerText || el.value || '').replace(/\\s+/g, ' ').trim().slice(0, 120),
+    tag: el.tagName, type: (el.type || '').toLowerCase(), role: el.getAttribute('role') || '',
+    checked: !!(el.checked ?? (el.getAttribute('aria-checked') === 'true')), disabled: !!el.disabled,
+  };
+})()"""
+
+FOCUS_FIELD_JS = """(() => {
+  const name = __NAME__;
+  const el = [...document.querySelectorAll('[data-jarri-name]')].find(e => e.getAttribute('data-jarri-name') === name);
+  if (!el) return { missing: true };
+  el.focus();
+  if (el.select) el.select();
+  else {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  return { tag: el.tagName, type: (el.type || '').toLowerCase(), readonly: !!el.readOnly, editable: !!el.isContentEditable };
+})()"""
+
+CHOOSE_JS = """(() => {
+  const name = __NAME__, want = __WANT__;
+  const el = [...document.querySelectorAll('[data-jarri-name]')].find(e => e.getAttribute('data-jarri-name') === name);
+  if (!el) return { missing: true };
+  if (el.tagName !== 'SELECT') return { notSelect: true };
+  const opt = [...el.options].find(o => o.text.trim() === want);
+  if (!opt) return { noOption: true, options: [...el.options].map(o => o.text.trim()).slice(0, 40) };
+  el.value = opt.value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true };
+})()"""
+
+VIEWPORT_JS = "[innerWidth / 2, innerHeight / 2]"
+
+BATCH_MAX_STEPS = 50
+BATCH_MAX_WAIT_S = 10
+
+
+def form_snapshot(page):
+    return page.evaluate(FORM_JS)
+
+
+def field(page, name, scroll=True):
+    result = page.evaluate(FIELD_JS.replace("__NAME__", json.dumps(name)).replace("__SCROLL__", "true" if scroll else "false"))
+    if result.get("missing"):
+        raise ApiError(404, {"error": "unknown_field", "name": name, "hint": "read the form again"})
+    return result
+
+
+def field_or_none(page, name):
+    result = page.evaluate(FIELD_JS.replace("__NAME__", json.dumps(name)).replace("__SCROLL__", "true"))
+    return None if result.get("missing") else result
+
+
+def stable_field(page, name):
+    """Scrolls the field into view and waits until it stops moving, so the click lands where it is."""
+    pos = field(page, name)
+    for _ in range(12):
+        time.sleep(0.08)
+        again = field(page, name, scroll=False)
+        if abs(again["x"] - pos["x"]) < 1 and abs(again["y"] - pos["y"]) < 1:
+            return again
+        pos = again
+    raise ApiError(409, {"error": "moving", "name": name, "hint": "the element keeps moving, try again"})
+
+
+def mouse(page, kind, x, y, clicks=0):
+    page.call("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, "button": "left", "clickCount": clicks})
+
+
+def click_at(page, x, y):
+    mouse(page, "mouseMoved", x, y)
+    mouse(page, "mousePressed", x, y, 1)
+    mouse(page, "mouseReleased", x, y, 1)
+
+
+def step_fill(tab_id, page, step):
+    name, value = step.get("name", ""), step.get("value")
+    if not isinstance(value, str) or len(value) > 2000:
+        raise ApiError(400, {"error": "bad_value"})
+    info = page.evaluate(FOCUS_FIELD_JS.replace("__NAME__", json.dumps(name)))
+    if info.get("missing"):
+        raise ApiError(404, {"error": "unknown_field", "name": name})
+    if info["type"] == "password":
+        raise ApiError(403, {"error": "password_not_allowed"})
+    text_input = info["tag"] in ("INPUT", "TEXTAREA") and info["type"] not in ("file", "checkbox", "radio", "button", "submit", "range")
+    typeable = text_input or info["editable"]
+    if not typeable or info["readonly"]:
+        raise ApiError(403, {"error": "not_typeable", "name": name})
+    page.call("Input.insertText", {"text": value})
+    return {"filled": name, "chars": len(value)}
+
+
+def step_click(tab_id, page, step):
+    name = step.get("name", "")
+    pos = stable_field(page, name)
+    if pos["disabled"]:
+        raise ApiError(409, {"error": "disabled", "name": name})
+    label = pos["text"]
+    if RISKY.search(label):
+        require_approval(tab_id, name, label, "click", step.get("approvalId"))
+    click_at(page, pos["x"], pos["y"])
+    return {"clicked": name}
+
+
+def step_check(tab_id, page, step):
+    name, want = step.get("name", ""), bool(step.get("value", True))
+    pos = stable_field(page, name)
+    if pos["type"] not in ("checkbox", "radio") and pos["role"] not in ("checkbox", "radio", "switch"):
+        raise ApiError(403, {"error": "not_checkable", "name": name})
+    if pos["checked"] != want:
+        click_at(page, pos["x"], pos["y"])
+    return {"checked": want, "name": name}
+
+
+def step_choose(tab_id, page, step):
+    name, want = step.get("name", ""), step.get("value")
+    if not isinstance(want, str):
+        raise ApiError(400, {"error": "bad_value"})
+    res = page.evaluate(CHOOSE_JS.replace("__NAME__", json.dumps(name)).replace("__WANT__", json.dumps(want)))
+    if res.get("missing"):
+        raise ApiError(404, {"error": "unknown_field", "name": name})
+    if res.get("notSelect"):
+        raise ApiError(403, {"error": "not_a_list", "name": name, "hint": "use click for this control"})
+    if res.get("noOption"):
+        raise ApiError(404, {"error": "no_such_option", "options": res["options"]})
+    return {"chose": want, "name": name}
+
+
+def step_press(tab_id, page, step):
+    key = step.get("key")
+    if key not in PRESS_KEYS:
+        raise ApiError(400, {"error": "bad_key", "allowed": list(PRESS_KEYS)})
+    if key == "Enter":
+        context = page.evaluate(FOCUSED_JS) or ""
+        if RISKY.search(context):
+            require_approval(tab_id, "", context, "press", step.get("approvalId"))
+    code, text = PRESS_KEYS[key]
+    base = {"key": key, "code": key, "windowsVirtualKeyCode": code}
+    down = {**base, "type": "rawKeyDown"}
+    if text:
+        down["text"] = text
+    page.call("Input.dispatchKeyEvent", down)
+    page.call("Input.dispatchKeyEvent", {**base, "type": "keyUp"})
+    return {"pressed": key}
+
+
+def step_scroll(tab_id, page, step):
+    value = step.get("value") or {}
+    if "to" in value:
+        stable_field(page, value["to"])
+        return {"scrolledTo": value["to"]}
+    dy = int(value.get("dy", 0))
+    vx, vy = page.evaluate(VIEWPORT_JS)
+    page.call("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": vx, "y": vy, "deltaX": 0, "deltaY": dy})
+    time.sleep(0.15)
+    return {"scrolledBy": dy}
+
+
+def step_drag(tab_id, page, step):
+    start = stable_field(page, step.get("name", ""))
+    value = step.get("value") or {}
+    if "to" in value:
+        end = stable_field(page, value["to"])
+        ex, ey = end["x"], end["y"]
+    else:
+        ex, ey = start["x"] + int(value.get("dx", 0)), start["y"] + int(value.get("dy", 0))
+    mouse(page, "mouseMoved", start["x"], start["y"])
+    mouse(page, "mousePressed", start["x"], start["y"], 1)
+    for i in range(1, 11):  # ten small moves, so sliders and sortable lists follow the pointer
+        mouse(page, "mouseMoved", start["x"] + (ex - start["x"]) * i / 10, start["y"] + (ey - start["y"]) * i / 10)
+        time.sleep(0.02)
+    mouse(page, "mouseReleased", ex, ey, 1)
+    return {"dragged": step.get("name", "")}
+
+
+def step_hover(tab_id, page, step):
+    pos = stable_field(page, step.get("name", ""))
+    mouse(page, "mouseMoved", pos["x"], pos["y"])
+    time.sleep(0.15)
+    return {"hovered": step.get("name", "")}
+
+
+def step_wait(tab_id, page, step):
+    if "ms" in step:
+        time.sleep(min(max(int(step["ms"]), 0), BATCH_MAX_WAIT_S * 1000) / 1000)
+        return {"waitedMs": int(step["ms"])}
+    name = step.get("name", "")
+    timeout = min(float(step.get("timeout", 5)), BATCH_MAX_WAIT_S)
+    end = time.time() + timeout
+    while time.time() < end:
+        found = field_or_none(page, name)
+        if found and found["w"] > 0:
+            return {"appeared": name}
+        time.sleep(0.2)
+    raise ApiError(408, {"error": "wait_timeout", "name": name})
+
+
+STEP_HANDLERS = {
+    "fill": step_fill, "click": step_click, "check": step_check, "choose": step_choose,
+    "press": step_press, "scroll": step_scroll, "drag": step_drag, "hover": step_hover, "wait": step_wait,
+}
+ACTIONS_THAT_NAVIGATE = {"click", "press", "choose", "check"}
+
+
+def batch(body):
+    check_paused()
+    tab_id, page = tab_connection(body.get("tab") or None)
+    ensure_granted(current_url(page))
+    steps = body.get("steps")
+    if not isinstance(steps, list) or not steps or len(steps) > BATCH_MAX_STEPS:
+        raise ApiError(400, {"error": "bad_steps", "max": BATCH_MAX_STEPS})
+    results = []
+    for index, step in enumerate(steps):
+        action = step.get("action")
+        handler = STEP_HANDLERS.get(action)
+        try:
+            if handler is None:
+                raise ApiError(400, {"error": "bad_action", "allowed": list(STEP_HANDLERS)})
+            check_paused()
+            log("intent", f"Next: {action} {step.get('name', step.get('key', ''))}")
+            bar_update()
+            out = handler(tab_id, page, step)
+            if action in ACTIONS_THAT_NAVIGATE:
+                wait_ready(page, first=0.05)
+                enforce_after_move(tab_id, page)
+        except ApiError as error:
+            raise ApiError(error.status, {**error.body, "stoppedAt": index, "results": results})
+        results.append({"i": index, "action": action, **out})
+    form = form_snapshot(page)
+    return {"ok": True, "results": results, "url": form["url"], "title": form["title"], "total": form["total"], "fields": form["fields"]}
+
+
+
 def route(method, path, qs, body):
     global PAUSED
     if method == "GET":
@@ -954,6 +1267,10 @@ def route(method, path, qs, body):
         if path == "/text":
             chars = min(max(int(qs.get("chars", [6000])[0]), 500), 20000)
             return 200, read_text(qs.get("tab", [None])[0], chars)
+        if path == "/form":
+            tab_id, page = tab_connection(qs.get("tab", [None])[0])
+            ensure_granted(current_url(page))
+            return 200, form_snapshot(page)
         if path == "/events":
             return 200, list(EVENTS)
         if path == "/requests":
@@ -979,6 +1296,8 @@ def route(method, path, qs, body):
             return 200, open_url(body)
         if path == "/act":
             return 200, act(body)
+        if path == "/batch":
+            return 200, batch(body)
         if path == "/permissions":
             return 200, grant(body)
         if path == "/permissions/revoke":
