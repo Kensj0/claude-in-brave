@@ -503,8 +503,16 @@ def check_paused():
         raise ApiError(423, {"error": "paused"})
 
 
+BROWSER_START = threading.Lock()  # only one request may start Brave at a time
+
+
 def ensure_browser():
     """Start Brave with the debug pipe if it is not running. Its fds 3 and 4 are the pipe."""
+    with BROWSER_START:
+        return _start_browser()
+
+
+def _start_browser():
     global BROWSER
     if BROWSER is not None and not BROWSER.closed:
         return BROWSER
@@ -527,7 +535,7 @@ def ensure_browser():
     with open(os.path.join(STATE_DIR, "brave.log"), "ab") as errors:
         proc = subprocess.Popen(
             [BRAVE_BIN, "--remote-debugging-pipe", f"--user-data-dir={BRAVE_PROFILE}",
-             "--no-first-run", "--no-default-browser-check"]
+             "--no-first-run", "--no-default-browser-check", "--disable-gpu"]
             + (["--headless=new"] if BRAVE_HEADLESS else []) + ["about:blank"],
             close_fds=False, preexec_fn=child_setup,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
