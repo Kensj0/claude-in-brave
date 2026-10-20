@@ -1307,6 +1307,7 @@ def batch(body):
     steps = body.get("steps")
     if not isinstance(steps, list) or not steps or len(steps) > BATCH_MAX_STEPS:
         raise ApiError(400, {"error": "bad_steps", "max": BATCH_MAX_STEPS})
+    form_snapshot(page)  # gives every field its name on this page, so steps can refer to them right away
     results = []
     for index, step in enumerate(steps):
         action = step.get("action")
