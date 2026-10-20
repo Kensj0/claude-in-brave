@@ -199,7 +199,8 @@ TOOLS = [
         "name": "batch",
         "description": "Run several actions in order in one call. Each step is {action, name, value, key, ...}. "
                        "Actions: fill (name, value), click (name), check (name, value true/false), "
-                       "choose (name, value = option text), press (key), scroll (value {to: name} or {dy}), "
+                       "choose (name, value = option text, for plain lists), pick (name, value = option text, for custom menus "
+                       "and autocomplete: opens the menu, then clicks the option; a miss lists the real options), press (key), scroll (value {to: name} or {dy}), "
                        "drag (name, value {to: name} or {dx, dy}), hover (name), wait (name, timeout or ms). "
                        "Stops at the first error and says which step. Risky clicks return approval_required.",
         "inputSchema": {"type": "object", "properties": {

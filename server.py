@@ -1252,11 +1252,52 @@ def step_wait(tab_id, page, step):
     raise ApiError(408, {"error": "wait_timeout", "name": name})
 
 
+# Finds visible list options (custom menus, autocomplete, date lists). Returns the one whose text matches.
+PICK_JS = """(() => {
+  const want = __WANT__;
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const vis = el => {
+    const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+  };
+  const cands = [...document.querySelectorAll('[role=option], [role=menuitem], [role=listbox] li, [id*="-option-"], [class*="-option"]')]
+    .filter(vis).filter(el => norm(el.innerText || el.textContent));
+  const label = el => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80);
+  const options = cands.map(label).slice(0, 60);
+  const idx = cands.findIndex(el => norm(el.innerText || el.textContent) === norm(want));
+  if (idx < 0) return { found: false, options };
+  const r = cands[idx].getBoundingClientRect();
+  return { found: true, x: r.left + r.width / 2, y: r.top + r.height / 2, text: label(cands[idx]), options };
+})()"""
+
+
+def step_pick(tab_id, page, step):
+    name, want = step.get("name", ""), step.get("value")
+    if not isinstance(want, str) or not want:
+        raise ApiError(400, {"error": "bad_value"})
+    field_pos = stable_field(page, name)
+    click_at(page, field_pos["x"], field_pos["y"])  # opens the menu
+    end = time.time() + 3
+    last = {"found": False, "options": []}
+    while time.time() < end:
+        time.sleep(0.1)
+        last = page.evaluate(PICK_JS.replace("__WANT__", json.dumps(want)))
+        if last.get("found"):
+            break
+    if not last.get("found"):
+        raise ApiError(404, {"error": "no_such_option", "name": name, "options": last.get("options", [])})
+    if RISKY.search(last["text"]):
+        require_approval(tab_id, name, last["text"], "pick", step.get("approvalId"))
+    click_at(page, last["x"], last["y"])
+    return {"picked": last["text"], "name": name}
+
+
 STEP_HANDLERS = {
     "fill": step_fill, "click": step_click, "check": step_check, "choose": step_choose,
     "press": step_press, "scroll": step_scroll, "drag": step_drag, "hover": step_hover, "wait": step_wait,
+    "pick": step_pick,
 }
-ACTIONS_THAT_NAVIGATE = {"click", "press", "choose", "check"}
+ACTIONS_THAT_NAVIGATE = {"click", "press", "choose", "check", "pick"}
 
 
 def batch(body):

@@ -19,6 +19,7 @@ class FakePage:
         self.fields = fields          # name -> dict(kind, type, tag, role, checked, disabled, text, x, y, w, h)
         self.calls = []               # (method, params) for mouse, keys, text
         self.values = dict(text_values or {})
+        self.menu = {"found": False, "options": []}
 
     def evaluate(self, js):
         if "fields.push" in js:                       # FORM_JS
@@ -43,7 +44,7 @@ class FakePage:
                 return {"noOption": True, "options": options}
             self.values[name] = wanted
             return {"ok": True}
-        if "getBoundingClientRect" in js and "text:" in js:   # FIELD_JS
+        if "getBoundingClientRect" in js and "text:" in js and "[role=option]" not in js:   # FIELD_JS
             name = self._name(js)
             if name not in self.fields:
                 return {"missing": True}
@@ -51,6 +52,8 @@ class FakePage:
             return {"x": f["x"], "y": f["y"], "w": f.get("w", 80), "h": f.get("h", 20), "text": f.get("text", name),
                     "tag": f.get("tag", "INPUT"), "type": f.get("type", "text"), "role": f.get("role", ""),
                     "checked": f.get("checked", False), "disabled": f.get("disabled", False)}
+        if "[role=option]" in js:                     # PICK_JS
+            return self.menu
         if "document.readyState" in js:
             return "complete"
         if "location.href" in js:
@@ -67,6 +70,23 @@ class FakePage:
         return {}
 
 
+class FakeClock:
+    """Time moves forward on every call, so the server's polling loops always end."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        self.now += 0.05
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def strftime(self, *a):
+        return "00:00:00"
+
+
 def install(page):
     """Patch the parts that talk to the real browser so batch() runs against the fake page."""
     patches = [
@@ -77,7 +97,7 @@ def install(page):
         mock.patch.object(server, "bar_update", lambda: None),
         mock.patch.object(server, "log", lambda *a: None),
         mock.patch.object(server, "current_url", lambda page: "https://example.test/form"),
-        mock.patch.object(server, "time", mock.Mock(time=lambda: 0.0, sleep=lambda s: None)),
+        mock.patch.object(server, "time", FakeClock()),
     ]
     for p in patches:
         p.start()
@@ -151,6 +171,20 @@ class Batch(unittest.TestCase):
             self.run_steps([{"action": "choose", "name": "land", "value": "Danmark"}])
         self.assertEqual(ctx.exception.body["error"], "no_such_option")
         self.assertEqual(ctx.exception.body["options"], ["Sverige", "Norge"])
+
+    def test_pick_clicks_the_matching_option(self):
+        self.page.menu = {"found": True, "x": 50, "y": 60, "text": "Maths", "options": ["Maths", "Physics"]}
+        out = self.run_steps([{"action": "pick", "name": "skicka", "value": "Maths"}])
+        self.assertEqual(out["results"][0]["picked"], "Maths")
+        clicks = [p for m, p in self.page.calls if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed"]
+        self.assertTrue(any(c["x"] == 50 and c["y"] == 60 for c in clicks))
+
+    def test_pick_reports_real_options_when_missing(self):
+        self.page.menu = {"found": False, "options": ["Physics", "Chemistry"]}
+        with self.assertRaises(server.ApiError) as ctx:
+            self.run_steps([{"action": "pick", "name": "land", "value": "Maths"}])
+        self.assertEqual(ctx.exception.body["error"], "no_such_option")
+        self.assertEqual(ctx.exception.body["options"], ["Physics", "Chemistry"])
 
     def test_bad_steps_are_refused(self):
         with self.assertRaises(server.ApiError) as ctx:
