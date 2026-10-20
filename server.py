@@ -42,6 +42,7 @@ import signal
 import contextlib
 import json
 import os
+import queue
 import re
 import select
 import subprocess
@@ -274,8 +275,11 @@ class Pipe:
         self.network = {}  # page session -> recent requests and their status (F12 Network)
         self.closed = False
         self.cond = threading.Condition()
-        self.write_lock = threading.Lock()
+        # Commands go through a queue and a writer thread. The reader thread must never block on a write,
+        # or it stops reading Brave's answers, Brave stops reading our commands, and both sides freeze.
+        self.outbox = queue.Queue()
         threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._writer, daemon=True).start()
 
     def _reader(self):
         buf = b""
@@ -358,13 +362,28 @@ class Pipe:
             item["body"] = redact(result.get("body", ""))
 
     def _write(self, message):
-        data = json.dumps(message).encode() + b"\0"
-        with self.write_lock:  # replies and acks may come from the reader thread, keep messages whole
-            # Never wait forever on a pipe Brave does not read: fail the request instead of freezing everything.
-            _, writable, _ = select.select([], [self.cmd_w], [], TIMEOUT_S)
-            if not writable:
-                raise ConnectionError("browser is not reading its commands")
-            os.write(self.cmd_w, data)
+        if self.closed:
+            raise ConnectionError("browser is closed")
+        self.outbox.put(json.dumps(message).encode() + b"\0")
+
+    def _writer(self):
+        while True:
+            data = memoryview(self.outbox.get())
+            while data:
+                # Never wait forever on a pipe Brave does not read: give up and close instead of freezing.
+                _, writable, _ = select.select([], [self.cmd_w], [], TIMEOUT_S)
+                if not writable:
+                    with self.cond:
+                        self.closed = True
+                        self.cond.notify_all()
+                    return
+                try:
+                    data = data[os.write(self.cmd_w, data):]
+                except OSError:  # Brave is gone
+                    with self.cond:
+                        self.closed = True
+                        self.cond.notify_all()
+                    return
 
     def send_no_wait(self, method, params, session):
         with self.cond:
