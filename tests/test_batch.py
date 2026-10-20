@@ -186,6 +186,13 @@ class Batch(unittest.TestCase):
         self.assertEqual(ctx.exception.body["error"], "no_such_option")
         self.assertEqual(ctx.exception.body["options"], ["Physics", "Chemistry"])
 
+    def test_day_labels_match_calendar_wording(self):
+        import datetime
+        self.assertEqual(server.day_label(datetime.date(2026, 10, 20)), "Tuesday, October 20th, 2026")
+        self.assertEqual(server.day_label(datetime.date(2026, 3, 1)), "Sunday, March 1st, 2026")
+        self.assertEqual(server.day_label(datetime.date(2026, 3, 11)), "Wednesday, March 11th, 2026")
+        self.assertEqual(server.day_label(datetime.date(2026, 3, 22)), "Sunday, March 22nd, 2026")
+
     def test_bad_steps_are_refused(self):
         with self.assertRaises(server.ApiError) as ctx:
             server.batch({"tab": None, "steps": []})

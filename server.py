@@ -40,6 +40,7 @@ import atexit
 import faulthandler
 import signal
 import contextlib
+import datetime
 import json
 import os
 import queue
@@ -1292,12 +1293,96 @@ def step_pick(tab_id, page, step):
     return {"picked": last["text"], "name": name}
 
 
+# ---- Datum: vanliga datumfält skrivs direkt, kalendrar väljs dag för dag ----
+
+DATE_SET_JS = """(() => {
+  const name = __NAME__, value = __VALUE__;
+  const el = [...document.querySelectorAll('[data-jarri-name]')].find(e => e.getAttribute('data-jarri-name') === name);
+  if (!el) return { missing: true };
+  el.focus();
+  el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true, value: el.value };
+})()"""
+
+CALENDAR_DAY_JS = """(() => {
+  const want = __LABEL__;
+  const el = [...document.querySelectorAll('[aria-label]')].find(e => {
+    const a = e.getAttribute('aria-label') || '';
+    return a.startsWith('Choose ') && a.endsWith(want) && e.getAttribute('aria-disabled') !== 'true';
+  });
+  if (!el) return { found: false };
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  const r = el.getBoundingClientRect();
+  return { found: true, x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()"""
+
+CALENDAR_HEADER_JS = """(() => {
+  const h = document.querySelector('.react-datepicker__current-month');
+  return { header: h ? h.textContent.trim() : null };
+})()"""
+
+CALENDAR_BUTTON_JS = """(() => {
+  const want = __LABEL__;
+  const el = document.querySelector('[aria-label="' + want + '"]');
+  if (!el) return { found: false };
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  const r = el.getBoundingClientRect();
+  return { found: true, x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()"""
+
+
+def ordinal(day):
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def day_label(d):
+    """How a calendar names a day, for example 'Tuesday, October 20th, 2026'."""
+    return f"{d.strftime('%A')}, {d.strftime('%B')} {ordinal(d.day)}, {d.year}"
+
+
+def step_date(tab_id, page, step):
+    name, value = step.get("name", ""), step.get("value")
+    try:
+        target = datetime.date.fromisoformat(str(value))
+    except ValueError:
+        raise ApiError(400, {"error": "bad_value", "hint": "use YYYY-MM-DD"})
+    info = field(page, name)
+    if info["type"] == "date":  # a native date field takes the value directly
+        page.evaluate(DATE_SET_JS.replace("__NAME__", json.dumps(name)).replace("__VALUE__", json.dumps(target.isoformat())))
+        return {"date": target.isoformat(), "name": name}
+    click_at(page, info["x"], info["y"])  # opens the calendar
+    time.sleep(0.2)
+    label = day_label(target)
+    for _ in range(24):  # up to two years of months
+        found = page.evaluate(CALENDAR_DAY_JS.replace("__LABEL__", json.dumps(label)))
+        if found.get("found"):
+            click_at(page, found["x"], found["y"])
+            return {"date": target.isoformat(), "name": name}
+        header = page.evaluate(CALENDAR_HEADER_JS).get("header")
+        if not header:
+            raise ApiError(409, {"error": "calendar_not_open", "name": name})
+        shown = datetime.datetime.strptime(header, "%B %Y").date().replace(day=1)
+        button = "Next Month" if shown < target.replace(day=1) else "Previous Month"
+        pos = page.evaluate(CALENDAR_BUTTON_JS.replace("__LABEL__", json.dumps(button)))
+        if not pos.get("found"):
+            raise ApiError(404, {"error": "no_month_button", "button": button})
+        click_at(page, pos["x"], pos["y"])
+        time.sleep(0.1)
+    raise ApiError(404, {"error": "date_not_found", "date": target.isoformat()})
+
+
 STEP_HANDLERS = {
     "fill": step_fill, "click": step_click, "check": step_check, "choose": step_choose,
     "press": step_press, "scroll": step_scroll, "drag": step_drag, "hover": step_hover, "wait": step_wait,
-    "pick": step_pick,
+    "pick": step_pick, "date": step_date,
 }
-ACTIONS_THAT_NAVIGATE = {"click", "press", "choose", "check", "pick"}
+ACTIONS_THAT_NAVIGATE = {"click", "press", "choose", "check", "pick", "date"}
 
 
 def batch(body):
