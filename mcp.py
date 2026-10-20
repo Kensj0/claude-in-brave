@@ -93,6 +93,35 @@ def run_act(args):
     return call_service("POST", "/act", body)
 
 
+def run_form(args):
+    query = f'?tab={args["tab"]}' if args.get("tab") else ""
+    return call_service("GET", "/form" + query)
+
+
+def run_batch(args):
+    body = {"steps": args["steps"]}
+    if args.get("tab"):
+        body["tab"] = args["tab"]
+    return call_service("POST", "/batch", body)
+
+
+def form_text(payload):
+    head = f'{payload["url"]} | {payload["title"]} | {payload["total"]} fields'
+    lines = []
+    for f in payload["fields"]:
+        value = "" if f.get("value") is None else f' = "{f["value"]}"'
+        options = f' options={f["options"]}' if f.get("options") else ""
+        lines.append(f'{f["kind"]} "{f["name"]}"{value}{options}')
+    return "\n".join([head] + lines)
+
+
+def batch_text(payload):
+    if payload.get("error"):
+        return f'{payload["error"]} at step {payload.get("stoppedAt")}: {payload.get("detail", "")}'.strip()
+    done = [str(r) for r in payload.get("results", [])]
+    return "\n".join(["done: " + "; ".join(done)] + [form_text(payload)] if payload.get("fields") is not None else done)
+
+
 def run_requests(args):
     return call_service("GET", "/requests")
 
@@ -157,6 +186,27 @@ TOOLS = [
             "url": {"type": "string"}, "tab": {"type": "string"}}, "required": ["url"]},
         "run": run_open,
         "text": digest_text,
+    },
+    {
+        "name": "form",
+        "description": "Read every field on the page in one call: kind, stable name, label, value, options. "
+                       "Use the names in batch.",
+        "inputSchema": {"type": "object", "properties": {"tab": {"type": "string"}}},
+        "run": run_form,
+        "text": form_text,
+    },
+    {
+        "name": "batch",
+        "description": "Run several actions in order in one call. Each step is {action, name, value, key, ...}. "
+                       "Actions: fill (name, value), click (name), check (name, value true/false), "
+                       "choose (name, value = option text), press (key), scroll (value {to: name} or {dy}), "
+                       "drag (name, value {to: name} or {dx, dy}), hover (name), wait (name, timeout or ms). "
+                       "Stops at the first error and says which step. Risky clicks return approval_required.",
+        "inputSchema": {"type": "object", "properties": {
+            "steps": {"type": "array", "items": {"type": "object"}},
+            "tab": {"type": "string"}}, "required": ["steps"]},
+        "run": run_batch,
+        "text": batch_text,
     },
     {
         "name": "act",
