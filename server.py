@@ -37,10 +37,13 @@ Binds to 127.0.0.1 only and accepts requests from the same allowed origins as th
 """
 
 import atexit
+import faulthandler
+import signal
 import contextlib
 import json
 import os
 import re
+import select
 import subprocess
 import threading
 import time
@@ -51,6 +54,10 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("JARRI_BROWSER_PORT", "8786"))
+_STATE = os.path.expanduser(os.environ.get("JARRI_BROWSER_STATE", "~/.local/state/jarri-browser"))
+os.makedirs(_STATE, mode=0o700, exist_ok=True)
+_STACKS = open(os.path.join(_STATE, "stacks.log"), "a")
+faulthandler.register(signal.SIGUSR1, file=_STACKS, all_threads=True)  # kill -USR1 writes every thread's stack
 STATE_DIR = os.path.expanduser(os.environ.get("JARRI_BROWSER_STATE", "~/.local/state/jarri-browser"))
 PERMISSIONS_FILE = os.path.join(STATE_DIR, "permissions.json")
 BRAVE_BIN = os.environ.get("JARRI_BRAVE_BIN", "/opt/brave.com/brave/brave")
@@ -351,8 +358,13 @@ class Pipe:
             item["body"] = redact(result.get("body", ""))
 
     def _write(self, message):
+        data = json.dumps(message).encode() + b"\0"
         with self.write_lock:  # replies and acks may come from the reader thread, keep messages whole
-            os.write(self.cmd_w, json.dumps(message).encode() + b"\0")
+            # Never wait forever on a pipe Brave does not read: fail the request instead of freezing everything.
+            _, writable, _ = select.select([], [self.cmd_w], [], TIMEOUT_S)
+            if not writable:
+                raise ConnectionError("browser is not reading its commands")
+            os.write(self.cmd_w, data)
 
     def send_no_wait(self, method, params, session):
         with self.cond:
